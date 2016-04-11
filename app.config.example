@@ -1,0 +1,12 @@
+[{lager, [{handlers, [{lager_console_backend, info}]}]}
+  %This is the auto-builder/auto-reloader. It takes ~10 seconds
+  %after startup before it starts doing its thing. It's a dev thing,
+  %not a prod thing.
+ ,{sync, [
+   {log, [warnings, errors]}
+   ,{growl, none}
+   ,{src_dirs,
+      {replace, [{"./apps/eradius/src", [{outdir, "./_build/default/lib/eradius/ebin"}]}]}}
+   ]}
+ ,{eradius, [{ssl_opts, [{cacertfile, "ca.pem"}, {certfile, "server.pem"}]}]}
+].

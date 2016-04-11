@@ -1,0 +1,47 @@
+This is an alpha quality RADIUS/EAP server.
+
+It currently supports EAP-MD5, EAP-MSCHAPv2, and PEAPv1-MSCHAPv2.
+
+It shares no code with and is related only in function to the travelping/jungerl
+project of the same name.
+
+It has been tested with eapol_test. It currently fails to work with Android,
+Windows 7, and OS X supplicants.
+
+Getting started:
+* Install rebar3 and put it on your PATH.
+* Copy app.config.example to app.config
+  * The contents of the eradius ssl_opts list are passed to ssl:ssl_accept/2. Modify
+    the list as required to point to your SSL certificates and include any password
+    required to unlock them.
+* Run make (or rebar3 compile) to fetch deps and build the project.
+* Run "make start" to start the server. Run "make watch" to start the server
+  as well as rustyio's sync auto-recompiler.
+
+Dependencies:
+* lager
+* lager_syslog
+* sync
+rebar3 handles dependency fetching and compilation.
+
+Known issues:
+* Loglevels are wildly inappropriate.
+* Too little validation is done on incoming data.
+* Listen port, user credentials, and NAS secret are hard-coded.
+* RADIUS packet handler crashes rather than sending an Access-Reject if sent
+  a non-EAP packet.
+* MPPE keys are not correctly calculated.
+* MSCHAPv2 authentication failure terminates the EAP conversation rather than
+  presenting the option of retrying authentication.
+* Very little validation is performed on PEAP packets. No validation is
+  performed on TLS payloads in PEAP packets.
+* Only PEAPv1 is supported. However, we do not check if the peer has
+  negotiated PEAPv0, and will happily emit PEAP packets with a version of 0.
+* TLSv1.0 PEAP connections fail to complete Phase 1. v1.1 and later succeed.
+* TLS messages transmited by the NAS that are split across multiple RADIUS
+  packets will not be handled correctly. The PEAP handling code needs to
+  check for this condition and accumulate the complete TLS packet before
+  sending it off to the TLS handler.
+
+License:
+All code in the project is released under the terms of the GPLv2 or later.

@@ -1,0 +1,8 @@
+{application, eradius,
+ [
+  {description, "Yet another Erlang RADIUS server."},
+  {vsn, "0.0.1"},
+  {applications, [ kernel, stdlib, lager, ssl ]},
+  {mod, {eradius_app, []}},
+  {env, []}
+ ]}.

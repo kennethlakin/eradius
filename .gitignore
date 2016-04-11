@@ -1,0 +1,7 @@
+*.beam
+erl_crash.dump
+app.config
+rebar.lock
+/log
+/tags
+/_build
