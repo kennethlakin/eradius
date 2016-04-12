@@ -12,6 +12,29 @@ fakeSockTabName() ->
 start_link() ->
   gen_server:start_link({local, getName()}, ?MODULE, [], []).
 
+%FIXME: Change the free port allocation to work like this:
+%       tls_udp carries around a map of ip -> free ports structure that looks like
+%         ip -> queue() ports_in_use
+%            -> queue() ports_free
+%            -> integer() next_port_prealloc_start
+%            -> integer() port_alloc_chunk_size
+%
+%       This is used like so, when we want to find a free port:
+%       * if ip_not_in_map
+%         * insert into state:
+%             * IP
+%               * empty ports_in_use queue
+%               * ports_free queue loaded with 100 ports
+%               * next_port_prealloc_start (set to 101)
+%               * port_alloc_chunk_size (set to 100)
+%         * Return new state and proceed with subroutine
+%       * if ports_free queue is empty:
+%         * alloc port_alloc_chunk_size ports starting at next_port_prealloc_start
+%         * put those ports in to ports_free queue
+%         * increase port_alloc_chunk_size by 100 unless...
+%           If port_alloc_chunk_Size is at 1000, then it remains that size.
+%         * return new state and proceed with subroutine.
+%       * Pop off the next item in ports_free. Return it and the new state.
 locateFreePort(Ip, State) ->
   locateFreePort(Ip, State, 0).
 locateFreePort(_, _, 65530) ->

@@ -61,7 +61,7 @@ handle({handle, {_, Id, _, _Type, TypeData},
           end;
         _ ->
           lager:warning("Malformed MSCHAPv2 packet."),
-          {stay, State}
+          {ignore, bad_packet, State}
       end;
     {mschap_success_sent, _AuthChallenge, _Name} ->
       case TypeData of

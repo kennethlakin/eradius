@@ -1,12 +1,12 @@
 This is an alpha quality RADIUS/EAP server.
 
-It currently supports EAP-MD5, EAP-MSCHAPv2, and PEAPv1-MSCHAPv2.
+It currently supports EAP-MD5, EAP-MSCHAPv2, and PEAPv0/1-MSCHAPv2.
 
 It shares no code with and is related only in function to the travelping/jungerl
 project of the same name.
 
-It has been tested with eapol_test. It currently fails to work with Android,
-Windows 7, and OS X supplicants.
+It has been tested with eapol_test and a couple of Android devices. It currently
+fails to work with Windows 7 and OS X supplicants.
 
 Getting started:
 * Install rebar3 and put it on your PATH.
@@ -19,29 +19,38 @@ Getting started:
   as well as rustyio's sync auto-recompiler.
 
 Dependencies:
+* Erlang 18 or later
 * lager
 * lager_syslog
 * sync
 rebar3 handles dependency fetching and compilation.
 
 Known issues:
+* The project contains a copy of ssl_record.erl from OTP 18.3. The BEAST 
+  mitigation added to OTP in commits f1f1d43 and fc668fb freaks out all
+  TLS 1.0 supplicants I've tested with. With the BEAST mitigation disabled,
+  Android, eapol_test, and Windows 7 supplicants work correctly. The copy of 
+  ssl_record.erl will be removed when a toggle for the BEAST mitigations
+  makes it to upstream. See also:
+  http://erlang.org/pipermail/erlang-questions/2012-August/068622.html
+* MPPE keys are not correctly calculated for TLS 1.1 or 1.2 supplicants.
+  NOTE: It's not currently clear if this is a problem with eapol_test or a
+        problem with Erlang's PRF for those modes. TLS 1.0 supplicants work
+        just fine.
 * Loglevels are wildly inappropriate.
 * Too little validation is done on incoming data.
 * Listen port, user credentials, and NAS secret are hard-coded.
 * RADIUS packet handler crashes rather than sending an Access-Reject if sent
   a non-EAP packet.
-* MPPE keys are not correctly calculated.
 * MSCHAPv2 authentication failure terminates the EAP conversation rather than
   presenting the option of retrying authentication.
 * Very little validation is performed on PEAP packets. No validation is
   performed on TLS payloads in PEAP packets.
-* Only PEAPv1 is supported. However, we do not check if the peer has
-  negotiated PEAPv0, and will happily emit PEAP packets with a version of 0.
-* TLSv1.0 PEAP connections fail to complete Phase 1. v1.1 and later succeed.
 * TLS messages transmited by the NAS that are split across multiple RADIUS
   packets will not be handled correctly. The PEAP handling code needs to
   check for this condition and accumulate the complete TLS packet before
   sending it off to the TLS handler.
+* Windows 7's PEAP and MSCHAPv2 quirks are not yet handled.
 
 License:
 All code in the project is released under the terms of the GPLv2 or later.

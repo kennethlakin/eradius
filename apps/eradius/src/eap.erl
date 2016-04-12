@@ -359,8 +359,8 @@ sendEapMessage(RadType, Type, EapMessageList, Id
           undefined -> #{};
           MSK ->
             LastRad=maps:get(last_rad, State),
-            MasterRecvCryptKey=binary:part(MSK, 0, 32 ),
-            MasterSendCryptKey=binary:part(MSK, 32, 32),
+            MasterRecvCryptKey=binary:part(MSK, 32, 32),
+            MasterSendCryptKey=binary:part(MSK, 0, 32 ),
             <<RecvKey:50/bytes>> =radius_server:scramble_mppe_key(MasterRecvCryptKey, LastRad),
             <<SendKey:50/bytes>> =radius_server:scramble_mppe_key(MasterSendCryptKey, LastRad),
             #{mschap_mppe_send_key => [RecvKey]
