@@ -27,18 +27,17 @@ verifyAuthPlausibility(#{}) -> ok.
 
 %If we have an EAP-message, we MUST have a Message-Authenticator:
 verifyPacket(Addr,
-             %FIXME: This won't work if we have more than one message auth
-             %       attr, but it's probably an error to have more than one to
-             %       begin with.
              _, #{message_authenticator := {[MsgAuth], AuthBin}},
              <<Type:1/bytes, Identifier:1/bytes, Len:2/bytes, ReqAuth:16/bytes, AttrBin/binary>>) ->
 
-  %FIXME: Look this up based on the NAS IP and other such properties!
+  %FIXME: Look this up based on the NAS IP and other properties!
   NASSecret=radius_server:nas_secret(Addr),
   BlankedAttrBin=zeroAttr(AttrBin, AuthBin),
   CalculatedAuth=crypto:hmac(md5, NASSecret,
                                  <<Type/binary, Identifier/binary, Len/binary,
                                    ReqAuth/binary, BlankedAttrBin/binary>>),
+  lager:debug("DECODE MsgAuth  ~p", [MsgAuth]),
+  lager:debug("DECODE CalcAuth ~p", [CalculatedAuth]),
   case CalculatedAuth == MsgAuth of
     true -> ok;
     false -> error
@@ -58,9 +57,8 @@ verifyPacket(Addr, Auth, #{user_password := {[MsgVerifier], _}
   NASSecret=radius_server:nas_secret(Addr),
   SharedSecretDigest=crypto:hash(md5, <<NASSecret/binary, Auth/binary>>),
   CalculatedVerifier=crypto:exor(SharedSecretDigest, PaddedPass),
-  lager:info("Matches? ~p", [CalculatedVerifier == MsgVerifier]),
-  lager:info("C ~p ~p", [CalculatedVerifier, byte_size(CalculatedVerifier)]),
-  lager:info("A ~p ~p", [MsgVerifier, byte_size(MsgVerifier)]),
+  lager:debug("DECODE MsgVerifier  ~p", [MsgVerifier]),
+  lager:debug("DECODE CalcVerifier ~p", [CalculatedVerifier]),
   case CalculatedVerifier == MsgVerifier of
     true -> ok;
     false -> error
@@ -151,7 +149,7 @@ decodeAttributes(Pkt= <<T:1/bytes, L:1/bytes, Rest/binary>>,  Attrs) ->
           %FIXME: Maybe add some logging here.
           {error, attr_length_incorrect};
         {warn, unrecognized_attr} ->
-          lager:notice("Unknown attr type=~p, data=~p", [Type, RawData]),
+          lager:notice("DECODE Unknown attr type ~p, data ~p", [Type, RawData]),
           decodeAttributes(binary:part(Pkt, Length, Size-Length), Attrs);
         {ok, HumType, Data} ->
           RawAttr= <<T/binary, L/binary, RawData/binary>>,
@@ -175,8 +173,8 @@ decodeRadius(P = <<_:1/bytes, _:1/bytes, L:2/bytes, _:16/bytes, _/binary>>) ->
       %Trim any padding:
       <<Pkt:Length/bytes, _/binary>> =P,
       case doDecodeRadius(Pkt) of
-        {ok, Code, RequestType, Identifier, Authenticator, Rest} ->
-          {ok, Code, RequestType, Identifier, Length, Authenticator, Rest}
+        {ok, {Code, RequestType, Identifier, Authenticator, Rest}} ->
+          {ok, {Code, RequestType, Identifier, Length, Authenticator, Rest}}
       end
   end;
 %If we're here, our packet is obviously too short to contain the data required,
@@ -196,7 +194,7 @@ doDecodeRadius(<<C:1/bytes, Identifier:1/bytes, _:2/bytes, Authenticator:16/byte
     11 -> access_challenge;
     _ -> unrecognized
   end,
-  {ok, Code, RequestType, Identifier, Authenticator, Rest}.
+  {ok, {Code, RequestType, Identifier, Authenticator, Rest}}.
 
 zeroAttr(Attrs, <<>>) -> Attrs;
 %An attr with size 1 is invalid and should have been caught by other code.

@@ -37,7 +37,7 @@ Known issues:
   NOTE: It's not currently clear if this is a problem with eapol_test or a
         problem with Erlang's PRF for those modes. TLS 1.0 supplicants work
         just fine.
-* Loglevels are wildly inappropriate.
+* Loglevels are somewhat inappropriate.
 * Too little validation is done on incoming data.
 * Listen port, user credentials, and NAS secret are hard-coded.
 * RADIUS packet handler crashes rather than sending an Access-Reject if sent

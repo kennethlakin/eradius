@@ -1,4 +1,4 @@
-[{lager, [{handlers, [{lager_console_backend, info}]}]}
+[{lager, [{handlers, [{lager_console_backend, notice}]}]}
   %This is the auto-builder/auto-reloader. It takes ~10 seconds
   %after startup before it starts doing its thing. It's a dev thing,
   %not a prod thing.

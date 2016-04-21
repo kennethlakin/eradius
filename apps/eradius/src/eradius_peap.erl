@@ -5,11 +5,10 @@
 
 handle({handle, {_, Id, _, _Type, TypeData},
     {Ip, _, _, _, _, RadState}},
-    State=#{peap := MethodData=#{state := MethodState}, tx_credits := Credits}) ->
+    State=#{peap := MethodData=#{state := MethodState}}) ->
   case MethodState of
     undefined ->
-      lager:info("In PEAP startup! Sending PEAP Start!"),
-      %PEAP Start Flag:
+      lager:info("PEAPv? Sending start"),
       StartFlag = <<0:1, 0:1, 1:1, 0:3>>,
       Version=1,
       Data = <<25, StartFlag/bitstring,  Version:2>>,
@@ -25,21 +24,24 @@ handle({handle, {_, Id, _, _Type, TypeData},
         1 ->
           <<_:1, _MoreFrags:1, _Start:1, 0:3, PeapVer:2, _TLSLen:4/bytes, Data/binary>> = TypeData
       end,
-      lager:info("Got a reply back from our start packet! It's probably a TLS start!"),
+      lager:info("PEAPv? Got reply"),
       {TlsSrvPid, NewState}=
         case maps:get(tls_srv_pid, State) of
           undefined ->
-            lager:info("No TLS server helper. Starting one!"),
             {ok, P}=radius_worker:start(eradius_peap_tls_srv, self()),
+            lager:debug("PEAPv? TLS Helper started ~p", [P]),
             link(P),
             {P, State#{tls_srv_pid := P}};
           P ->
-            lager:info("TLS server helper running. Using ~p", [P]),
+            lager:debug("PEAPv? Using TLS Helper ~p", [P]),
             {P, State}
         end,
-      lager:info("Peer wants PEAPv~p", [PeapVer]),
+      case PeapVer of
+        0 -> ok;
+        1 -> ok
+      end,
+      lager:info("PEAPv~p Continuing Phase 1", [PeapVer]),
       ok=eradius_peap_tls_srv:start_tls(TlsSrvPid, Ip, RadState, Data),
-      lager:info("start_tls kicked off. Returning."),
       {send_queued, NewState#{peap := MethodData#{state := tls_not_up
                                                   ,peap_ver => PeapVer
                                                   ,tls_state => server_hello_not_done
@@ -49,7 +51,7 @@ handle({handle, {_, Id, _, _Type, TypeData},
       #{peap_ver := PeapVer}=MethodData,
       case TypeData of
         <<0:6, PeapVer:2>> ->
-          lager:info("Oh cool! A request for more info! Sending more!"),
+          lager:info("PEAPv~p Sending queued data", [PeapVer]),
           {send_queued, State};
         <<LenIncluded:1, MoreFrags:1, Start:1, 0:3, _PeapVer:2, _/binary>> ->
           case LenIncluded of
@@ -59,14 +61,16 @@ handle({handle, {_, Id, _, _Type, TypeData},
               _TLSLen=undefined,
               <<LenIncluded:1, MoreFrags:1, Start:1, 0:3, _PeapVer:2, Data/binary>> = TypeData
           end,
-          lager:info("More TLS negotiation"),
+          lager:info("PEAPv~p Handling TLS Data ~p bytes", [PeapVer, byte_size(Data)]),
           #{tls_srv_pid := SrvPid} = State,
           eradius_peap_tls_srv:handlePacket(SrvPid, Ip, Data),
           {send_queued, State}
       end;
     tls_up ->
-      lager:info("Got PEAP data prompt after TLS up"),
+      #{peap_ver := PeapVer}=MethodData,
+      lager:info("PEAPv~p Starting Phase 2", [PeapVer]),
       true=eap:txQueueIsEmpty(State),
+      lager:debug("PEAPv~p Tx TLS identity request.", [PeapVer]),
       ok=sendTlsIdentityRequest(Id, State),
       {send_queued, State#{peap := MethodData#{state := inner_ident_sent}}};
     inner_ident_sent ->
@@ -79,12 +83,13 @@ handle({handle, {_, Id, _, _Type, TypeData},
           _TLSLen=undefined,
           <<LenIncluded:1, _MoreFrags:1, _Start:1, 0:3, PeapVer:2, Data/binary>> = TypeData
       end,
-      lager:info("More TLS cyphertext Current credits ~p Work len ~p", [Credits, queue:len(maps:get(tx_queue, State)) ]),
+      lager:info("PEAPv~p Handling TLS Data ~p bytes", [PeapVer, byte_size(Data)]),
       SrvPid=maps:get(tls_srv_pid, State),
       eradius_peap_tls_srv:handlePacket(SrvPid, Ip, Data),
       {send_queued, State};
     inner_auth_success ->
-      lager:info("Got PEAP prompt for more data after inner auth complete! Sending success!"),
+      #{peap_ver := PeapVer}=MethodData,
+      lager:info("PEAPv~p Inner auth success. Sending RADIUS success", [PeapVer]),
       true=eap:txQueueIsEmpty(State),
       %FIXME: ACTUALLY! because we are doing MSCHAPv2, we should send
       %       a MS-MPPE-Recv-Key   and   MS-MPPE-Send-Key
@@ -104,7 +109,8 @@ handle({tls_up, RadState}, State=#{current_method := peap
                                         ,last_rad := {_,_,_,_,_,RS}
                                         ,tls_msk := undefined
                                         ,tls_srv_pid := SrvPid
-                                        ,peap := MethodData})
+                                        ,peap := MethodData=
+                                        #{peap_ver := PeapVer}})
   when RS == RadState ->
   % So, PEAP, section 2.8. Key derivation:
   %   This is how we'll do it on the server side:
@@ -125,12 +131,9 @@ handle({tls_up, RadState}, State=#{current_method := peap
   %          for more info! This
   %          https://w1.fi/cgit/hostap/plain/wpa_supplicant/eap_testing.txt
   %          might also be of interest.
-  lager:info("****TLS UP!**** Credits: ~p Work queue ~p ", [maps:get(tx_credits, State), queue:len(maps:get(tx_queue, State))]),
   PEAPLabel= <<"client EAP encryption">>,
   {ok, <<MSK:64/bytes, _:64/bytes>>}=eradius_peap_tls_srv:run_prf(SrvPid, master_secret, PEAPLabel,
                                                                   [client_random, server_random], 128),
-  {ok, <<MSK:64/bytes>>}=eradius_peap_tls_srv:run_prf(SrvPid, master_secret, PEAPLabel,
-                                                                  [client_random, server_random], 64),
   %FIXME: wpa_supplicant disagrees with us about the result of running the PRF
   %       with the Master Secret as the secret, the above string as the label,
   %       and the client random concatted with the server random.
@@ -147,7 +150,7 @@ handle({tls_up, RadState}, State=#{current_method := peap
   %       FIXME: Okay. The problem is with the TLS 1.1 and 1.2 PRF.
   %              TLS 1.0 works just fine. Not clear if this is an issue w/
   %              wpa_supplicant or with Erlang SSL.
-  lager:info("MSK is ~p", [radius_server:bin_to_hex(MSK)]),
+  lager:debug("PEAPv~p MSK is ~p", [PeapVer, radius_server:bin_to_hex(MSK)]),
   {ok, State#{tls_msk := MSK, peap := MethodData#{state := tls_up}}};
 
 %For wider compatiblity, enqueue the TLS records from ServerHello to
@@ -156,20 +159,21 @@ handle({tls_up, RadState}, State=#{current_method := peap
 %don't seem to like that very much.
 handle({eradius_send_cyphertext, D}, State=#{current_method := peap
                                              ,peap := MethodData=#{tls_state := server_hello_not_done
-                                                                  ,tls_queue := TlsQueue}}) ->
+                                                                   ,peap_ver := PeapVer
+                                                                   ,tls_queue := TlsQueue}}) ->
   Data= iolist_to_binary(D),
   NewQueue= <<TlsQueue/binary, Data/binary>>,
   <<22, _:4/bytes, MsgType:1/bytes, _/binary>> = Data,
   case MsgType of
     <<14>> ->
-      lager:info("********Got ServerHelloDone. Sending backlog."),
+      lager:debug("PEAPv~p ServerHelloDone found. Tx backlog", [PeapVer]),
       {Ret, NS}=handle({eradius_send_cyphertext, NewQueue},
                        State#{peap := MethodData#{tls_state := server_hello_sending
                                                   ,tls_queue := <<>>}}),
       #{peap := MD2}=NS,
       {Ret, NS#{peap := MD2#{tls_state := server_hello_done}}};
     _ ->
-      lager:info("********Enqueuing. Waiting on ServerHelloDone."),
+      lager:debug("PEAPv~p Enqueuing handshake type ~w", [PeapVer, MsgType]),
       {ok, State#{peap := MethodData#{tls_queue := NewQueue}}}
   end;
 %Do the same queueing for ChangeCypher and Handshake with client.
@@ -178,52 +182,51 @@ handle({eradius_send_cyphertext, D}, State=#{current_method := peap
 %       Double-check the TLS docs.
 handle({eradius_send_cyphertext, D}, State=#{current_method := peap
                                              ,peap := MethodData=#{tls_state := server_hello_done
-                                                                  ,tls_queue := TlsQueue}}) ->
+                                                                   ,peap_ver := PeapVer
+                                                                   ,tls_queue := TlsQueue}}) ->
   Data= iolist_to_binary(D),
   NewQueue= <<TlsQueue/binary, Data/binary>>,
   <<ContentType:1/bytes, _/binary>> = Data,
   case ContentType of
     <<22>> ->
-      lager:info("********Got ServerHandshake. Sending backlog."),
+      lager:debug("PEAPv~p ServerHandshake found. Tx backlog", [PeapVer]),
       handle({eradius_send_cyphertext, NewQueue},
              State#{peap := MethodData#{tls_state := server_handshake_done
                                         ,tls_queue := <<>>}});
     _ ->
-      lager:info("********Enqueuing. Waiting on ServerHandshake."),
+      lager:debug("PEAPv~p Enqueuing record type ~w", [PeapVer, ContentType]),
       {ok, State#{peap := MethodData#{tls_queue := NewQueue}}}
   end;
 
 handle({eradius_send_cyphertext, D}, State=#{current_method := peap
-                                            ,peap := #{peap_ver := PEAPVersion}}) ->
+                                            ,peap := #{peap_ver := PeapVer}}) ->
   #{tx_credits := Credits} = State,
   Data=iolist_to_binary(D),
   %FIXME: Make this not hard-coded!!
   EapMtu=1024,
-  PktList=encode_packets(EapMtu, not_start, PEAPVersion, Data),
+  PktList=encode_packets(EapMtu, not_start, PeapVer, Data),
   {ok, NewState}=eap:enqueueWork(access_challenge, request, PktList, State),
   #{tx_queue := Q} = NewState,
-  lager:info("enqueued ~p bytes of cyphertext. Packet split into ~p parts. Work queue len: ~p Credits: ~p",
-             [byte_size(Data), length(PktList), queue:len(Q), Credits]),
-  %FIXME: Do NOT add a tx_credit here. This packet was sent internally, not
-  %       from the peer.
+  lager:debug("PEAPv~p Enqueued ~p bytes of cyphertext. Packet split into ~p parts. Work queue len: ~p Credits: ~p",
+             [PeapVer, byte_size(Data), length(PktList), queue:len(Q), Credits]),
   case eap:transmitIfPossible(NewState) of
     {ok, no_credits, SN} -> SN;
     {ok, SN} -> SN
   end,
-  NQ=maps:get(tx_queue, SN),
-  NC=maps:get(tx_credits, SN),
-  lager:info("Cyphertext \"send\" done. Queue ~p Credits ~p", [queue:len(NQ), NC]),
   {ok, SN};
 
 handle({ssl, _SslSocket, SslData}, State=#{current_method := peap
                                                ,tls_srv_pid := SrvPid
                                                ,last_rad := LastRad
                                                ,last_eap := LastEap={_, Id, _,_,_}
-                                               ,peap := MethodState})
+                                               ,peap := MethodState=
+                                               #{peap_ver := PeapVer}})
   when is_pid(SrvPid) ->
+  lager:info("PEAPv~p Handling ~p bytes tunneled plaintext", [PeapVer, byte_size(SslData)]),
   %FIXME: we really need to track the EAP IDs for the
   %inner and outer conversations separately.
   {ok, DecodedMessage={_,Id,_,_,_}}=decodeTunneledMessage(SslData, LastEap, State),
+  lager:debug("PEAPv~p Decoded message ~w", [PeapVer, DecodedMessage]),
 
   NewState=
     case maps:is_key(mschapv2, State) of
@@ -252,14 +255,16 @@ handle({ssl, _SslSocket, SslData}, State=#{current_method := peap
     {auth_ok, {_, success, Packets}, S} ->
       {ok, D}=prepareWork(success, Id, Packets, S),
       ok=eradius_peap_tls_srv:send(SrvPid, D),
+      lager:info("PEAPv~p Tx tunneled success", [PeapVer]),
       {ok, S#{peap := MethodState#{state := inner_auth_success}}};
     {auth_fail, {_, failure, Packets}, S} ->
       {ok, D}=prepareWork(failure, Id, Packets, S),
+      lager:info("PEAPv~p Tx tunneled failure", [PeapVer]),
       ok=eradius_peap_tls_srv:send(SrvPid, D),
       {ok, S#{peap := MethodState#{state := inner_auth_failure}}}
   end.
 
-%So, we COULD TLS renegotiate if we were doing certificate-based
+%So, we COULD do TLS renegotiate if we were doing certificate-based
 %authentication. The renegotiation would technically still be a
 %part of PEAP Phase 1.
 %However, we're not going to be doing that for now, so we're
@@ -269,7 +274,6 @@ handle({ssl, _SslSocket, SslData}, State=#{current_method := peap
 %PEAPv0
 sendTlsIdentityRequest(_, #{tls_srv_pid := SrvPid
                              ,peap := #{peap_ver := 0}}) ->
-  lager:info("Sending TLS identity request."),
   Msg= <<1>>,
   ok=eradius_peap_tls_srv:send(SrvPid, Msg);
 %PEAPv1
@@ -283,7 +287,6 @@ sendTlsIdentityRequest(Id, #{tls_srv_pid := SrvPid
   %Although, the IDs between the two EAP conversations could drift
   %out of sync. So, FIXME: we really need to track the EAP IDs for the
   %inner and outer conversations separately.
-  lager:info("Sending TLS identity request."),
   [Msg]=eap:encodeEapMessage(request, Id, <<1>>),
   ok=eradius_peap_tls_srv:send(SrvPid, Msg).
 
@@ -292,7 +295,7 @@ decodeTunneledMessage(Message, {Code,Id,_,_,_}, #{peap := #{peap_ver := 0}}) ->
   case Message of
     <<26, Data/binary>> -> DecodedMessage={Code, Id, FakeLen, mschapv2, Data};
     <<1, Data/binary>> -> DecodedMessage={Code, Id, FakeLen, identity, Data}
-    %<<1, _:1/bytes, _:2/bytes, 33, _/binary>> (FIXME: Possible EAP Extension packet)
+    %<<1, _:1/bytes, _:2/bytes, 33, _/binary>> (TODO: Possible EAP Extension packet)
   end,
   {ok, DecodedMessage};
 decodeTunneledMessage(Message, {_,Id,_,_,_}, #{peap := #{peap_ver := 1}}) ->

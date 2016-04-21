@@ -10,6 +10,6 @@ start_worker(Args) ->
   Pid=spawn_link(?MODULE, createNewServer, Args),
   {ok, Pid}.
 
+%FIXME: Consider adding RadState to the key data.
 createNewServer(TlsSinkPid, PeerIp, _RadState, FirstPacket) ->
-  lager:notice("Ignoring RadState in createNewServer."),
   ok=tls_udp:createNewServer(TlsSinkPid, PeerIp, FirstPacket).

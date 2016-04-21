@@ -10,7 +10,7 @@ start_link() ->
   supervisor:start_link({local, getName()}, ?MODULE, []).
 
 init([]) ->
-  %FIXME: Tune the strat/intensity values.
+  %FIXME: Tune the period/intensity values.
   {ok, {{one_for_all, 5, 10}, [
                                #{id => radius_server:getName()
                                  ,start => {radius_server, start_link, []}

@@ -70,15 +70,10 @@ init(_) ->
   %%Contains the state of each fake socket. Used to fake out getopts and
   %%setopts.
   ets:new(fakeSockTabName(), [named_table, public]),
-  %Load our SSL keys and passwords for the same and such.
+  %Load our SSL certs and passwords for the same and such.
   {ok, App}=application:get_application(),
   Opts=application:get_env(App, ssl_opts, []),
 
-  %So. What to track?
-  % * {Sink PID, PeerIp} -> {SslPid, Port, FakeSocket, SslSock}
-  % * FakeSock -> {SinkPID, PeerIp}
-  % * {PeerIp, Port} -> ok (this is used to check for uniqueness of
-  %                     IP/port combo and nothing more.
   {ok, #{pidIpMap => #{}
          ,ipPortMap => #{}
          ,fakeSockMap => #{}
@@ -97,7 +92,7 @@ handle_call({eradius_handle_packet, SinkPid, Addr, Data}, _From,
   %Check to see if this pid has a fakesock alloced to it.
   case maps:get({SinkPid, Addr}, PidIpMap, undefined) of
     undefined ->
-      lager:info("SSL server not found for ~p ~p", [SinkPid, Addr]),
+      lager:debug("TLS_UDP Starting TLS server for ~p ~p", [SinkPid, Addr]),
       {ok, Port}=locateFreePort(Addr, State),
       {ok, Pid}=startSslServerHelper(Addr, Port, SinkPid, SslOpts),
       MonRef=monitor(process, Pid),
@@ -107,33 +102,27 @@ handle_call({eradius_handle_packet, SinkPid, Addr, Data}, _From,
             {ok, SslPid} ->
               case waitForTransToActive(FakeSock, MonRef, Pid) of
                 {error, proc_down} ->
-                  lager:warning("SSL startup proc crashed, waiting to get set to active."),
+                  lager:error("TLS_UDP TLS startup process crashed, waiting to get set to active."),
                   {reply, {error, proc_down}, State};
                 ok ->
-                  %NOTE: We do not yet have the TLS socket. That will come
-                  %much later in the process, after several packet exchanges.
                   demonitor(MonRef, [flush]),
-                  lager:info("Sending packet to SSL PID!"),
                   SslPid ! {tls_udp, FakeSock, Data},
 
-                  lager:info("Setting Pid/Ip map {~p, ~p} => {~p, ~p, ~p, ~p}",
-                              [SinkPid, Addr, SslPid, Port, FakeSock, undefined]),
                   NewPIM=PidIpMap#{{SinkPid, Addr} => {SslPid, Port, FakeSock, undefined}},
                   NewIPM=IpPortMap#{{Addr, Port} => ok},
                   NewFSM=FakeSockMap#{FakeSock => {SinkPid, Addr}},
                   {reply, ok, State#{pidIpMap := NewPIM, ipPortMap := NewIPM, fakeSockMap := NewFSM}}
               end;
             {error, proc_down} ->
-              lager:warning("SSL startup proc crashed, waiting for SSL Pid."),
+              lager:error("TLS_UDP SSL startup process crashed, waiting for TLS Pid."),
               {reply, {error, proc_down}, State}
           end;
         {error, proc_down} ->
-          lager:warning("SSL startup proc crashed, waiting for FakeSock."),
+          lager:error("TLS_UDP TLS startup proccess crashed, waiting for FakeSock."),
           {reply, {error, proc_down}, State}
       end;
     {SslPid, _, FakeSock, _} ->
-      lager:info("Found SSL Pid. Sending data to it"),
-      lager:info("Packet: ~p", [radius_server:bin_to_hex(Data)]),
+      lager:debug("TLS_UDP Found TLS server ~p. Using it", [SslPid]),
       SslPid ! {tls_udp, FakeSock, Data},
       {reply, ok, State}
   end.
@@ -161,14 +150,13 @@ start_worker([Addr, Port, SinkPid, Opts]) ->
 
 startSslServer(Addr, Port, SslSinkPid, AddlOpts) ->
   FakeSock=createFakeSockAndSignal(Addr, Port),
-  %FIXME: tls_udp is the tag applied to the messages that the ssl module will
+  %NOTE:  tls_udp is the tag applied to the messages that the ssl module will
   %       handle. Not sure if it should be configurable.
   %%This works, but it requires intercommunication between the setopts function
   %%and the SSL server initialization code. That's in there, and it works, but
   %%it's not pretty.
   Opts = [{cb_info, {?MODULE, tls_udp, closed, error}}] ++ AddlOpts,
   {ok, SSock}=ssl:ssl_accept(FakeSock, Opts),
-  %Transmit the SSL socket!
   %FIXME: Make this a proper call.
   ?MODULE:getName() ! {sslSock, FakeSock, SSock},
   ssl:controlling_process(SSock, SslSinkPid),
@@ -211,8 +199,6 @@ getPid(Sock) ->
   end.
 
 getopts(Sock, Opts) ->
-  lager:info("getopts ~p ~p", [Sock, Opts]),
-  %inet:getopts(Sock, Opts).
   case ets:lookup(fakeSockTabName(), Sock) of
     [] -> {error, einval};
     [{Sock, #{opts := OptMap}}] ->
@@ -230,8 +216,6 @@ getopts(Sock, Opts) ->
   end.
 
 setopts(Sock, Opts) ->
-  lager:info("setopts ~p ~p", [Sock, Opts]),
-  %inet:setopts(Sock, Opts).
   case ets:lookup(fakeSockTabName(), Sock) of
     [] -> {error, einval};
     [{Sock, Map=#{opts := OptMap=#{active := false}}}] ->
@@ -273,8 +257,6 @@ createNewOptMap(OptMap, Opts) ->
               end, OptMap, Opts).
 
 controlling_process(Sock, NewPid) ->
-  lager:info("controlling_process ~p ~p", [Sock, NewPid]),
-  %gen_udp:controlling_process(Sock, whereis(getName())),
   case ets:lookup(fakeSockTabName(), Sock) of
     [] -> {error, einval};
     [{Sock, Map}] ->
@@ -288,24 +270,21 @@ controlling_process(Sock, NewPid) ->
           ?MODULE:getName() ! {sslPid, Sock, NewPid},
           ok;
         Other ->
-          lager:warn("controlling_process called by ~p but ~p is owner. returning not_owner",
+          lager:warn("TLS_UDP controlling_process called by ~p but ~p is owner. returning not_owner",
                      [Self, Other]),
           {error, not_owner}
       end
   end.
 
-listen(Sock, Opts) ->
-  lager:info("listen~p, ~p", [Sock, Opts]),
+listen(Sock, _) ->
   case ets:lookup(fakeSockTabName(), Sock) of
     [] -> {error, einval};
     [{Sock, _}] -> {ok, Sock}
   end.
 
 close(Sock) ->
-  lager:info("close ~p", [Sock]),
-  %Hmm. Do we need to close the fake port?!?!
   %We do *not* need to close the fake port. erlang:ports/0 doesn't list
-  %it as a port! So, this is a port-shaped object, rather than a port.
+  %it as a port. So, this is a port-shaped object, rather than a port.
   %erlang:port_close(Sock),
   %FIXME: Send a "cleanup" message to tls_udp server. It will trigger:
   %       Lookup FakeSock to get {SinkPID, PeerIP}, then delete.
@@ -315,14 +294,12 @@ close(Sock) ->
   ok.
 
 peername(Sock) ->
-  lager:info("peername ~p", [Sock]),
   case ets:lookup(fakeSockTabName(), Sock) of
     [] -> {error, einval};
     [{Sock, #{peername := Peername}}] -> {ok, Peername}
   end.
 
 port(Sock) ->
-  lager:info("port ~p", [Sock]),
   case ets:lookup(fakeSockTabName(), Sock) of
     [] -> {error, einval};
     [{Sock, #{peername := {_, Port}}}] -> {ok, Port}

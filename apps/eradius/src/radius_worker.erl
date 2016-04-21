@@ -9,83 +9,32 @@
 start(Mod, Args) ->
   supervisor:start_child(radius_worker_sup:getName(), [{Mod, Args}]).
 
-%radius_worker_sup calls this when it is asked to start a child.
 start_link({Mod, Args}) ->
-  %We expect that start_worker will call start_link or equivalent.
   Mod:start_worker(Args).
 
 start_worker(Args={_,_,_,_}) ->
   gen_server:start_link(?MODULE, Args, []).
 
 init(S={_,_,_,_}) ->
+  lager:debug("RADIUS Worker started with args ~p", [S]),
   {ok, S, 0}.
 
-%So, here's the flow for child handlers:
-%% * Get passed the addr, port, RADIUS ID, and original packet
-%% * Work on the packet
-%% * Return ignore | reject (with optional Attributes) | accept (w/ attrs)
-%%    | challenge (w/ attrs) along with the original packet to the parent
-%%    (the radius_server module).
-%% * Now... the radius_server module will -in the case of reject/accept/challenge- save
-%%   both the original packet, *and* the response packet that it sends. If it
-%%   gets the *same* packet back from the NAS on the same addr and port, then
-%%   it will send the packet it sent previously in response to that request.
-%% ****** Actually... if at all possible, the child handler should send the
-%%        first reply. This lets the radius_server module just handle packet
-%%        dispatch and initial recording of addr/port/RADIUS_ID/packet info.
-%%      * ACTUALLY, the above intuition is not the best, I think. Might be best
-%%        to interleave Rx and Tx in this case. Or -fuck, IDK- have an Rx and a
-%%        separate Tx process? Surely they won't have to own their own UDP
-%%        socket... surely they can share one. (Made a separate Tx process and
-%%        a socket server that gives you Rx access to the socket, and allows
-%%        you to take and release ownership of the socket to perform Rx on the
-%%        socket.
-%%      * I suppose that the initial recording would set a flag that says that
-%%        packet is "being worked on", and maybe mention the PID that is
-%%        handling it. For protos like EAP that have conversations across
-%%        multiple packets, after the initial recording by the radius_server
-%%        module, the child handles status recording. It also records NAS-sent
-%%        packet and response packet. This scheme should let us avoid
-%%        bottlenecking in radius_server.
-%% * After a while (30 seconds??) this entry in the response packet cache will
-%%   be purged.
 handle_info(timeout, State={Addr, Port, Data, _}) ->
   radius_server:insertWorkEntry(?MODULE, {Addr, Port, Data}, working, self()),
   case radius_tx:findCachedEntry(Addr, Port, Data) of
     {ok, {_, Pkt}} ->
-      radius_tx:resend(Addr, Port, Pkt),
-      lager:info("Cached entry used!");
+      lager:info("RADIUS Packet is retransmission. Using cache"),
+      radius_tx:resend(Addr, Port, Pkt);
     none ->
       DecRet=decode:decodeRadius(Data),
-      lager:info("Got packet."),
       case DecRet of
-        {ok, _Code, _RequestType, Id, _Length, Auth, Rest} ->
-          Attrs=case decode:decodeAttributes(Rest) of
-                  {ok, A} -> A;
-                  {error, R} -> lager:info("Error: ~p", [R]), []
-                end,
-          NextStep=radius_server:determineWhatToDo(Attrs),
-          lager:info("We are going to do ~p next.", [NextStep]),
-          %FIXME: The checking done in verifyAuthPlausibility only makes sense
-          %       for an Access-Request packet!
-          case decode:verifyAuthPlausibility(Attrs) of
-            error ->
-              lager:warning("Dropping packet because illegal auth attr combination.");
-            ok ->
-              lager:info("Packet is plausible."),
-              Verify=decode:verifyPacket(Addr, Auth, Attrs, Data),
-              lager:info("verifyPacket returned ~p", [Verify]),
-              lager:info("Handing off packet"),
-              case Attrs of
-                #{state := {[_], SA}} ->
-                  lager:info("State attr found."),
-                  <<_:2/bytes, StateAttr/binary>> = SA;
-                _ ->
-                  lager:info("Creating new state attr."),
-                  StateAttr=radius_server:getNewStateData()
-              end,
-              Ret=NextStep:handlePacket({Addr, Port, Auth, Id, Data, StateAttr}, Attrs),
-              lager:info("handlePacket returned ~p", [Ret])
+        {ok, Rad={_,_,_,_,_,Rest}} ->
+          case decode:decodeAttributes(Rest) of
+            {ok, Attrs} ->
+              lager:debug("RADIUS Attrs decoded ~p", [Attrs]),
+              handlePacket(Addr, Port, Rad, Attrs, Data);
+            {error, R} ->
+              lager:notice("RADIUS Attr decode error ~p", [R])
           end;
         {discard, _} ->
           %FIXME: Increment a discard counter. Discriminate between the various
@@ -94,6 +43,35 @@ handle_info(timeout, State={Addr, Port, Data, _}) ->
       end
   end,
   {stop, normal, State}.
+
+handlePacket(Addr, Port, {_, _, Id, _, Auth, _}, Attrs, Data) ->
+  NextStep=radius_server:determineWhatToDo(Attrs),
+  lager:debug("RADIUS We got a ~p request", [NextStep]),
+  %FIXME: The checking done in verifyAuthPlausibility only makes sense
+  %       for an Access-Request packet!
+  case decode:verifyAuthPlausibility(Attrs) of
+    error ->
+      lager:notice("RADIUS Dropping packet because illegal auth attr combination");
+    ok ->
+      case decode:verifyPacket(Addr, Auth, Attrs, Data) of
+        error ->
+          lager:notice("RADIUS Packet verification failed");
+        ok ->
+          case Attrs of
+            #{state := {[_], SA}} ->
+              lager:debug("RADIUS Ongoing conversation"),
+              <<_:2/bytes, StateAttr/binary>> = SA;
+            _ ->
+              lager:debug("RADIUS New conversation"),
+              StateAttr=radius_server:getNewStateData()
+          end,
+          case NextStep:handlePacket({Addr, Port, Auth, Id, Data, StateAttr}, Attrs) of
+            ok -> ok;
+            {drop, _} -> ok; %FIXME: Add statistics?
+            ErrorRet -> lager:notice("RADIUS Handler failed. Reason ~p", [ErrorRet])
+          end
+      end
+  end.
 
 terminate(_, {Addr, Port, Data, StartTime}) ->
   ok=radius_server:deleteWorkEntry(?MODULE, {Addr, Port, Data}),

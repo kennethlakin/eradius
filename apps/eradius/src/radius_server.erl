@@ -34,6 +34,7 @@ init(_) ->
   %FIXME: Consider looking at the read_packets option.
   inet:setopts(UdpSock, [{active, false}]),
   inet:setopts(UdpSock, [{active, Schedulers}]),
+  lager:info("RADIUS Initialized with ~p workers", [Schedulers]),
   {ok, #{udp_sock => UdpSock, num_schedulers => Schedulers}}.
 
 %FIXME: Useful RFCS:
@@ -62,24 +63,26 @@ init(_) ->
 
 handle_cast({done, ElapsedTime}, State=#{udp_sock := Sock}) ->
   inet:setopts(Sock, [{active, 1}]),
-  lager:critical("Worker done. total time taken ~pus",
-                 [erlang:convert_time_unit(ElapsedTime, native, micro_seconds)]),
+  lager:info("RADIUS Worker done. total time taken ~pus",
+             [erlang:convert_time_unit(ElapsedTime, native, micro_seconds)]),
   {noreply, State}.
 
 handle_info({udp, Sock, Addr, Port, Data}, State=#{udp_sock := Sock}) ->
   T1=erlang:monotonic_time(),
   case isWorkEntry(radius_worker, {Addr, Port, Data}) of
     true ->
-      lager:info("RADIUS worker already working on packet. Dropping."),
+      lager:info("RADIUS Worker already working on packet. Dropping."),
       inet:setopts(Sock, [{active, 1}]),
       {noreply, State};
     false ->
+      lager:info("RADIUS Starting worker"),
       {ok, _}=radius_worker:start(radius_worker, {Addr, Port, Data, T1}),
       {noreply, State}
   end;
 %If all of our workers are busy, our socket falls into passive mode, and we get
 %this message. It can be safely ignored.
 handle_info({udp_passive, Sock}, State=#{udp_sock := Sock}) ->
+  lager:debug("RADIUS All workers busy"),
   {noreply, State}.
 
 %FIXME: Make these configurable.

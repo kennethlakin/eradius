@@ -18,39 +18,42 @@ tls_up(FSMPid, Msg={tls_up, _RadState}) ->
   gen_fsm:send_event(FSMPid, Msg).
 
 handlePacket(RadData={Ip, _Port, _Auth, _RadId, _Data, RadState}, #{eap_message := {EM, _}, message_authenticator := _}) ->
-  lager:info("Got packet. State data ~p", [RadState]),
   Message=concatMessage(EM),
   case decodeMessage(Message) of
     {ok, DecodedMessage={_, Id, _, _, _}} ->
-      lager:info("Eap decode message says pkt is okay."),
+      lager:info("EAP Packet okay"),
       FSMPid =
         case radius_server:getWorkEntry(?MODULE, {Id, RadState, Ip}) of
           {ok, {FsmPid, working}} ->
-            lager:info("~p is working on this. Dropping.", [FsmPid]),
-            drop;
+            lager:info("EAP ~p is working on this. Dropping", [FsmPid]),
+            {drop, working};
           {ok, {FsmPid, crashed}} ->
             %FIXME: What do do in this case?
-            lager:info("~p was working on this but crashed. Odd.", [FsmPid]),
-            drop;
+            lager:notice("EAP ~p was working on this but crashed. Odd.", [FsmPid]),
+            {drop, crashed};
           {ok, {FsmPid, waiting}} ->
-            lager:info("~p has this convo and is waiting. Using it.", [FsmPid]),
+            lager:info("EAP Handing off to ~p ", [FsmPid]),
             FsmPid;
           {error, work_entry_not_found} ->
-            lager:info("Starting fsm because no workers for this convo exist."),
+            lager:info("EAP New conversation"),
             {ok, FsmPid}=radius_worker:start(?MODULE, [DecodedMessage, RadData]),
             FsmPid
         end,
       case FSMPid of
-        drop -> ok;
+        {drop, Reason} -> {discard, Reason};
         _ ->
           Ret=gen_fsm:sync_send_event(FsmPid, {handle, DecodedMessage, RadData}, infinity),
           case Ret of
             ok -> ok;
-            _ -> lager:info("Handler returned non-ok: ~p", [Ret])
+            _ ->
+              lager:info("EAP Handler returned error ~p", [Ret]),
+              Ret
           end
       end;
     {discard, packet_too_short} ->
-      lager:warning("EAP: Packet too short!")
+      {discard, packet_too_short};
+    {discard, Reason} ->
+      {discard, Reason}
   end.
 
 decodeMessage(P = <<Code:1/bytes, ID:1/bytes, L:2/bytes, Type:1/bytes, _/binary>>) ->
@@ -94,82 +97,50 @@ getNewState(Id, RadState, Ip) ->
      ,tx_credits => 0
      ,tls_srv_pid => undefined
      ,tls_msk => undefined
-     %   mmm. EAP-TTLS says "multiple tunneled authentications may be
-     %   performed." It gives as example: Once TTLS tunnel is established, it
-     %   can be used to start an ENTIRELY NEW EAP SESSION. So, that would
-     %   imply firing up a *second* EAP FSM. PEAP(v2) Also supports this:
-     %   "[A]fter the TLS session is established another complete EAP negotiation
-     %   will occur..."
-     %   We... will not be supporting the establishment of a *second* tunnel
-     %   within the first tunneled method, I think. At least, not at first.
-     %
-     %   NOW, related to that, EAP-TTLS (AND PEAPv2) *also* supports *chaining* EAP
-     %   Authentications. So, you can *require* the user to auth with like GTC,
-     %   then MSCHAPv2, or maybe something else if one of those two fails. The
-     %   rules can get arbitrarily complex, really. So, we have both *nested*
-     %   EAP FSMs and we have *chained* EAP FSMs.
-     %
-     %   Let's work on supporting *chained* methods for now.
-     %   Just consider them a series of "inner" methods. (But read PEAPv2
-     %    (doc #10) section 2.2.2!)
      %,username => undefined
      %,user_pass => undefined
-     %FIXME: Look these up (or pass in) rather than hard-coding them.
+     %FIXME: Look these up rather than hard-coding them.
      ,username => <<"user">>
      ,user_pass => <<"pass">>
    }.
 
-%Also used to reset an EAP method's data.
+%Used to reset an EAP method's data.
 getNewMethodData() ->
   #{ username => undefined
      ,user_pass => undefined
      ,state => undefined}.
 
 start_worker(Args) ->
-  lager:info("EAP Worker starting with args ~p", [Args]),
+  lager:debug("EAP Worker started with args ~p", [Args]),
   gen_fsm:start_link(?MODULE, Args, []).
 
-init([{_, Id, _, _, _}, {Ip, _Port, _Auth, _RadId, _Data, RadState}]) ->
-  %Register self, using the provided data.
-  %Should register self in 'working' status, so that we don't have a race
+init([{_, Id, _, _, _}, {Ip, _, _, _, _, RadState}]) ->
   ok=radius_server:insertWorkEntry(?MODULE, {Id, RadState, Ip}, working, self()),
   process_flag(trap_exit, true),
   State=getNewState(Id, RadState, Ip),
   {ok, starting, State}.
 
-starting({handle, {response, _, _, nak, _}, _}, From, State) ->
-  %FIXME: We probably shouldn't stop, but should rather ignore the packet.
-  lager:info("Spurious NAK in startup."),
-  gen_fsm:reply(From, {error, spurious_nak}),
-  {stop, normal, State};
-%FIXME: Handle both EAP-Start (reply with identity request)
-%       and skip-right-to-the-EAP-method (just start running the method)
-%       methods of starting the EAP conversation, too!
+starting({handle, {response, _, _, nak, _}, _}, _, State) ->
+  lager:info("EAP Spurious NAK in conversation start"),
+  {reply, {discard, spurious_nak}, starting, State};
 starting(Msg={handle,
                       Eap={response, Id, _, EapType, EapTypeData},
                       Rad={Ip, _Port, _Auth, _RadId, _Data, RadState}},
           From, State=#{tx_credits := Credits})
   when Credits == 0 ->
   ok=radius_server:updateWorkEntry(?MODULE, {Id, RadState, Ip}, working, self()),
-  Continue =
-    case EapType of
-      identity -> proceed;
-      _ -> drop
-    end,
-  case Continue of
-    drop ->
-      lager:info("Got a non-identity, non-NAK packet on startup! Stopping!"),
-      %FIXME: We probably shouldn't stop, but should rather ignore the packet.
-      gen_fsm:reply(From, {error, spurious_non_ident}),
-      {stop, normal, State};
-    proceed ->
+  case EapType of
+    identity ->
       Username=EapTypeData,
       DefaultMethod=maps:get(default_method, State),
       NewState=State#{username := Username, current_method := DefaultMethod
                      ,DefaultMethod => getNewMethodData()},
       %Offer our default auth method
       DMFun=fun ?MODULE:DefaultMethod/2,
-      handleOuterPacket(From, DMFun, [Msg, NewState])
+      handleOuterPacket(From, DMFun, [Msg, NewState]);
+    _ ->
+      lager:info("EAP Got a ~p packet in conversation start. Ignoring", [EapType]),
+      {reply, {discard, spurious_non_ident}, starting, State}
   end.
 
 running(Msg={handle, {response, Id, _, nak, BinMethods},
@@ -179,22 +150,23 @@ running(Msg={handle, {response, Id, _, nak, BinMethods},
                   ,tx_credits := Credits})
   when Credits == 0 ->
   ok=radius_server:updateWorkEntry(?MODULE, {Id, RadState, Ip}, working, self()),
+  lager:info("EAP Negotiating alternate EAP method"),
   %FIXME: This only works for methods with non-expanded types.
   SuggestedMethods =
     case decodeEapAuthType(BinMethods) of
       M when is_list(M) -> M;
       R -> [R]
     end,
-  lager:info("Suggested methods: ~p", [SuggestedMethods]),
+  lager:debug("EAP Peer suggested methods ~p", [SuggestedMethods]),
   NewState=maps:remove(OldCurrentMethod, State),
   case findFirstCompatible(SuggestedMethods, SupportedMethods) of
     {error, none_compatible} ->
+      lager:info("EAP No compatible methods"),
       {ok, NextState}=enqueueAndMaybeTransmit(access_reject, failure, <<>>, NewState#{tx_credits := Credits+1}),
       gen_fsm:reply(From, ok),
       {stop, normal, NextState};
     {ok, Method} ->
-      lager:info("Best Valid method! ~p", [Method]),
-
+      lager:info("EAP Negotiated method ~p", [Method]),
       NextState=NewState#{current_method := Method, Method => getNewMethodData()},
       Fun=fun handleMethod/3,
       Args=[Method, Msg, NextState],
@@ -270,6 +242,7 @@ handleMethod(Msg={Task, Eap={_Code, _Id, _L, Type, TypeData},
   case Type of
     identity ->
       DefaultMethod=maps:get(default_method, NewState),
+      lager:info("EAP Offering default method ~p", [DefaultMethod]),
       %Offer our default auth method
       DMFun=fun ?MODULE:DefaultMethod/2,
       DMFun(Msg, NewState);
@@ -278,12 +251,7 @@ handleMethod(Msg={Task, Eap={_Code, _Id, _L, Type, TypeData},
     mschapv2->
       mschapv2(Msg, NewState);
     peap ->
-      peap(Msg, NewState);
-    _ ->
-      %FIXME: We should probably send back an EAP Failure if we reach here.
-      %       (rather than dropping the packet.)
-      lager:warning("Method ~p not handled. Ignoring packet.", [Type]),
-      {done, NewState}
+      peap(Msg, NewState)
   end.
 
 %@returns (just like all other method handlers)
@@ -304,7 +272,6 @@ md5({handle, Eap={_, Id, _, _Type, TypeData},
       %       generation. I *think* that doing things the way we do here
       %       alleviates the concern expressed. No. Section 11.2.2 and
       %       subsequent sections *alter* how these random bytes are selected.
-      %       Yay... :/ So we do have to have TTLS-specific code in here. Yay.
       Challenge=crypto:strong_rand_bytes(16),
       ChallengeLen=binary:encode_unsigned(byte_size(Challenge)),
       Data= <<4,ChallengeLen/binary,Challenge/binary>>,
@@ -371,12 +338,11 @@ sendEapMessage(RadType, Type, EapMessageList, Id
     end,
   TheAttrs=maps:merge(Attrs, MPPEAttrs),
   Pkt=decode:encodeAccess(Ip, RadType, RadId, RadAuth, TheAttrs),
-  lager:info("Transmitting to ~p ~p Total eap message size ~p", [Ip, Port, erlang:iolist_size(EapMessageList)]),
+  lager:info("EAP Tx ~p bytes to ~p:~p", [erlang:iolist_size(EapMessageList), Ip, Port]),
   radius_tx:send(Ip, Port, Pkt, RadData),
-  %If our EAP ID has changed, then we need to signal that we've moved on to
-  %the next packet in the conversation.
   case NID of
-    Id -> ok;
+    Id ->
+      ok=radius_server:updateWorkEntry(?MODULE, {Id, RadState, Ip}, waiting, self());
     NID ->
       ok=radius_server:insertWorkEntry(?MODULE, {NID, RadState, Ip}, waiting, self()),
       ok=radius_server:deleteWorkEntry(?MODULE, {Id, RadState, Ip})
@@ -410,10 +376,9 @@ transmitIfPossible(State=#{tx_queue := Queue
       {EapMessages, NewState}=
         case prepareWork(EapCode, Id, Data) of
           {ok, Messages} ->
-            lager:info("Sending all of ~p with size ~p", [Data, byte_size(Data)]),
             {Messages, State#{tx_queue := NewQueue}};
           {data_too_large, Messages, Rest} ->
-            lager:info("Sending part of ~p, leaving ~p bytes for the next iteration.", [Data, byte_size(Rest)]),
+            lager:debug("EAP Tx ~p bytes. ~p bytes in queue", [byte_size(Data), byte_size(Rest)]),
             NQ=queue:in_r(NewQueue, Rest),
             WNS=State#{tx_queue := NQ},
             {Messages, WNS}
@@ -422,7 +387,6 @@ transmitIfPossible(State=#{tx_queue := Queue
   end.
 
 enqueueWork(RadType, EapCode, Data, State) when is_list(Data) ->
-  lager:info("enqueueWork multiple called"),
   FinalState=
       lists:foldl(fun(D, S) ->
                       {ok, NS}=enqueueWork(RadType, EapCode, D, S),
@@ -431,7 +395,7 @@ enqueueWork(RadType, EapCode, Data, State) when is_list(Data) ->
                   State, Data),
   {ok, FinalState};
 enqueueWork(RadType, EapCode, Data, State=#{tx_queue := Queue}) ->
-  lager:info("enqueueWork single called with ~p bytes data ~p CurrQueue ~p", [byte_size(Data), Data, queue:to_list(Queue)]),
+  lager:debug("EAP Enqueuing ~p bytes. QueueLen ~p", [byte_size(Data), queue:len(Queue)]),
   NewQueue=queue:in({RadType, EapCode, Data}, Queue),
   {ok, State#{tx_queue := NewQueue}}.
 
@@ -446,7 +410,7 @@ prepareWork(Code, Id, <<Data:1024/bytes, Rest/binary>>) ->
   EapMessages=encodeEapMessage(Code, Id, Data),
   {data_too_large, EapMessages, Rest}.
 
-%NOTE: There's no need to put any code _here_ that handles a link MTU because
+%NOTE: There's no need to put any code _here_ that handles a MTU because
 %that is handled further up the stack.
 encodeEapMessage(Code, Id) ->
   encodeEapMessage(Code, Id, <<>>).
@@ -513,7 +477,7 @@ decodeEapAuthType(Type) when byte_size(Type) == 1 ->
     <<25>> -> peap;
     <<26>> -> mschapv2;
     <<52>> -> pwd; %EAP-PWD
-    %FIXME: expanded_types correctly.
+    %FIXME: handle expanded_types correctly.
     <<254>> -> expanded_type;
     <<255>> -> experimental;
     _ -> unknown
@@ -528,19 +492,19 @@ decodeEapAuthType(<<T:1/bytes, R/binary>>, Acc) ->
 
 terminate(Reason, _, #{work_key := Key}) when Reason == normal
                                  orelse Reason == shutdown ->
-  lager:info("Terminating because ~p, then deleting work record.", [Reason]),
+  lager:debug("EAP Terminating because ~p, then deleting work record.", [Reason]),
   case Key of
     undefined -> ok;
     _ -> radius_server:deleteWorkEntry(?MODULE, Key)
   end;
 terminate(Reason={shutdown, _}, _, #{work_key := Key}) ->
-  lager:info("Terminating because ~p, then deleting work record.", [Reason]),
+  lager:debug("EAP Terminating because ~p, then deleting work record.", [Reason]),
   case Key of
     undefined -> ok;
     _ -> radius_server:deleteWorkEntry(?MODULE, Key)
   end;
 terminate(Reason, _, #{work_key := Key}) ->
-  lager:info("Terminating because ~p, then indicating crash in work record.", [Reason]),
+  lager:debug("EAP Terminating because ~p, then indicating crash in work record.", [Reason]),
   case Key of
     undefined -> ok;
     _ -> radius_server:updateWorkEntry(?MODULE, Key, crashed, self())
@@ -551,7 +515,6 @@ handle_info({'EXIT', Pid, Reason}, _, State=#{tls_srv_pid := Pid}) ->
   {stop, Reason, State};
 handle_info(_, StateName, State) -> {next_state, StateName, State}.
 
-%FIXME: Determine if any of these need to be non-stub functions:
 handle_event(_, StateName,State) -> {next_state, StateName, State}.
 handle_sync_event(_, _, StateName,State) -> {reply, {error, unexpected}, StateName, State}.
 code_change(_, StateName, State, _) -> {ok, StateName, State}.

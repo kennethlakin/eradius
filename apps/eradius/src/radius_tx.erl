@@ -29,17 +29,14 @@ init(_) ->
   UdpSock=radius_sock:get_sock(),
   {ok, #{udp_sock => UdpSock}}.
 
-handle_call(C, _, State) ->
-  lager:warning("~p: Unexpected call ~p", [?MODULE, C]),
+handle_call(_, _, State) ->
   {noreply, State}.
 handle_cast({send, Addr, Port, Data}, S=#{udp_sock := Sock}) ->
   ok=gen_udp:send(Sock, Addr, Port, Data),
   {noreply, S};
-handle_cast(C, State) ->
-  lager:warning("~p: Unexpected cast ~p", [?MODULE, C]),
+handle_cast(_, State) ->
   {noreply, State}.
-handle_info(C, State) ->
-  lager:warning("~p: Unexpected info ~p", [?MODULE, C]),
+handle_info(_, State) ->
   {noreply, State}.
 
 terminate(_, _) -> ok.

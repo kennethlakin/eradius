@@ -22,29 +22,25 @@ start_link() ->
 init(_) ->
   process_flag(trap_exit, true),
   %FIXME: Make this port configurable.
-  {ok, UdpSock} = gen_udp:open(1812, [binary, {active, false}]),
+  Port=1812,
+  lager:info("RADIUS Listening on port ~p", [Port]),
+  {ok, UdpSock} = gen_udp:open(Port, [binary, {active, false}]),
   {ok, UdpSock}.
 
 getName() -> 
   eradius_radius_sock.
 
-handle_call(get_sock, _, UdpSock) -> {reply, UdpSock, UdpSock};
+handle_call(get_sock, _, UdpSock) ->
+  {reply, UdpSock, UdpSock};
 handle_call({take_ownership, Pid, UdpSock}, _, UdpSock) -> 
+  lager:debug("RADIUS Setting socket controlling process to ~p", [Pid]),
   Ret=gen_udp:controlling_process(UdpSock, Pid),
   {reply, Ret, UdpSock};
-handle_call(C, _, State) ->
-  lager:warning("~p: Unexpected call ~p", [?MODULE, C]),
-  {noreply, State}.
-
-handle_cast(C, _, State) ->
-  lager:warning("~p: Unexpected cast ~p", [?MODULE, C]),
-  {noreply, State}.
-
-handle_info(C, State) ->
-  lager:warning("~p: Unexpected info ~p", [?MODULE, C]),
-  {noreply, State}.
-
-terminate(_,UdpSock) -> 
+handle_call(_, _, State) ->
+  {reply, error, State}.
+terminate(_,UdpSock) ->
   gen_udp:close(UdpSock).
 
+handle_cast(_, _, State) -> {noreply, State}.
+handle_info(_, State) -> {noreply, State}.
 code_change(_, S, _) -> {ok, S}.

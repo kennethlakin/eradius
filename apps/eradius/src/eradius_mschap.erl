@@ -1,8 +1,10 @@
 -module(eradius_mschap).
 -compile([{parse_transform, lager_transform}]).
 
-%FIXME: Reduce the surface area here.
--compile(export_all).
+-export([handle/2]).
+-export([generateNtResponse/4, generateAuthenticatorResponse/5]).
+
+-export([run_test/0]).
 
 handle({handle, {_, Id, _, _Type, TypeData},
     {_, _, _, _, _, _}},
@@ -15,7 +17,10 @@ handle({handle, {_, Id, _, _Type, TypeData},
       NewState=State#{mschapv2 := MethodData#{state := {challenge_sent, MSCHAPv2Bytes, Name}}},
       NextId=eap:incrementId(Id),
       BytesLen=byte_size(MSCHAPv2Bytes),
-      Data=eradius_mschap:create_packet(challenge, NextId, <<BytesLen, MSCHAPv2Bytes/binary, Name/binary>>),
+      Data=create_packet(challenge, NextId, <<BytesLen, MSCHAPv2Bytes/binary, Name/binary>>),
+      lager:info("MSCHAP Tx challenge packet"),
+      lager:debug("MSCHAP Id ~p Challenge ~p Name ~p Len ~p",
+                  [NextId, radius_server:bin_to_hex(MSCHAPv2Bytes), Name, BytesLen]),
       {enqueue_and_send, {access_challenge, request, Data}, NewState};
     %NOTE: This message might be useful if the Mac machine continues to be dumb
     %when the RADIUS credentials have changed out from under it:
@@ -32,6 +37,10 @@ handle({handle, {_, Id, _, _Type, TypeData},
           %FIXME: This username might have a WinNT domain part. Ignore up to and
           %including the first "\", and then the rest is the username.
           ChapUserName/binary>> ->
+          lager:info("MSCHAP Rx challenge response"),
+          lager:debug("MSCHAP UserName ~p PeerChallenge ~p NtResponse ~p Flags ~p",
+                      [ChapUserName, radius_server:bin_to_hex(PeerChallenge)
+                       ,radius_server:bin_to_hex(NtResponse), Flags]),
           Password=maps:get(user_pass, State),
           %Convert password from UTF8 to UTF16-LE:
           ConvertedPass=unicode:characters_to_binary(Password,
@@ -40,13 +49,17 @@ handle({handle, {_, Id, _, _Type, TypeData},
                                                               ChapUserName, ConvertedPass),
           case CalculatedReponse == NtResponse of
             true ->
-              lager:info("Authenticator response valid."),
+              lager:info("MSCHAP Challenge response valid"),
               AuthResp=eradius_mschap:generateAuthenticatorResponse(ConvertedPass, NtResponse, PeerChallenge,
                                                                     AuthChallenge, ChapUserName),
               NextId=eap:incrementId(Id),
               Message= <<>>,
-              Data=eradius_mschap:create_packet(success, NextId, AuthResp, Message),
+              Data=create_packet(success, NextId, AuthResp, Message),
               NewState=State#{mschapv2 := MethodData#{state => {mschap_success_sent, AuthChallenge, _Name}}},
+              lager:info("MSCHAP Tx MSCHAP success"),
+              lager:debug("MSCHAP Id ~w AuthResponse ~p Message ~p Packet ~p",
+                          [NextId, radius_server:bin_to_hex(AuthResp)
+                           ,radius_server:bin_to_hex(Message), radius_server:bin_to_hex(Data)]),
               {enqueue_and_send, {access_challenge, request, Data}, NewState};
             false ->
               %FIXME: If the username is correct, then the password is invalid.
@@ -54,18 +67,27 @@ handle({handle, {_, Id, _, _Type, TypeData},
               %       If the username is incorrect, then all auth here is
               %       invalid. MAYBE send a non-retryable error with code 691
               %       and PROBABLY END the session.
-              lager:info("Authenticator response invalid."),
+              lager:notice("MSCHAP Challenge response invalid"),
+              lager:debug("MSCHAP Peer NtResponse ~p Correct NtResponse ~p",
+                          [radius_server:bin_to_hex(NtResponse)
+                           ,radius_server:bin_to_hex(CalculatedReponse)]),
               %FIXME: See above. This data should be sensible!
               %       Also, we shouldn't reject outright!
+              NextId=eap:incrementId(Id),
+              lager:info("MSCHAP Tx failure packet"),
+              %FIXME: Actually send the fail packet.
+              _FailPacket=create_packet(failure, NextId, 691, true, AuthChallenge, <<>>),
               {enqueue_and_send, {access_reject, failure, <<>>}, State}
           end;
         _ ->
-          lager:warning("Malformed MSCHAPv2 packet."),
+          lager:notice("MSCHAP Malformed packet"),
+          lager:debug("MSCHAP Packet ~p", [radius_server:bin_to_hex(TypeData)]),
           {ignore, bad_packet, State}
       end;
     {mschap_success_sent, _AuthChallenge, _Name} ->
       case TypeData of
         <<3>> ->
+          lager:info("MSCHAP Tx RADIUS success"),
           {auth_ok, {access_accept, success, <<>>}, State}
       end
   end.
@@ -73,7 +95,6 @@ handle({handle, {_, Id, _, _Type, TypeData},
 %TODO: Note: Everything in this module only handles MSCHAPv2, despite the
 %      module name. Adding support for older versions of MSCHAP is on the TODO
 %      list.
-
 create_packet(success, Id, AuthBin, Message) when is_binary(Message) ->
   create_packet(success, Id, <<AuthBin/binary, " M=", Message/binary>>).
 
@@ -101,7 +122,6 @@ create_packet(Type, Id, Data) ->
   <<26, Code/binary, Id/binary, MSLen:16, Data/binary>>.
 
 %Support functions:
-%FIXME: Note all of the ones that are present in MSCHAPv2 but not MSCHAPv1
 generateNtResponse(<<AuthChallenge:16/bytes>>, <<PeerChallenge:16/bytes>>,
                    UserName, Password) when
     byte_size(Password) =< 256*2 andalso byte_size(UserName) =< 256 ->
@@ -143,7 +163,7 @@ desEncrypt(<<Clear:8/bytes>>, <<A:7,B:7,C:7,D:7,E:7,F:7,G:7,H:7>>) ->
   Cypher.
 
 generateAuthenticatorResponse(Password, <<NtResponse:24/bytes>>, <<PeerChallenge:16/bytes>>,
-                              <<AuthChallenge:16/bytes>>, UserName) when 
+                              <<AuthChallenge:16/bytes>>, UserName) when
     byte_size(Password) =< 256*2 andalso byte_size(UserName) =< 256 ->
   %Magic server to client signing constant"
   Magic1= <<16#4D, 16#61, 16#67, 16#69, 16#63, 16#20, 16#73, 16#65, 16#72, 16#76,
@@ -181,49 +201,50 @@ checkAuthenticatorResponse(Password, <<NtResponse:24/bytes>>, <<PeerChallenge:16
                                                           AuthChallenge, UserName),
   MyResponse == ReceivedResponse.
 
-newPasswordEncryptedWithOldNtPasswordHash(NewPassword, OldPassword)
-  when byte_size(NewPassword) =< 256*2 andalso byte_size(OldPassword) =< 256*2 ->
-  <<PasswordHash:16/bytes>> = ntPasswordHash(OldPassword),
-  EncPwBlock = <<_:(256*2)/bytes, _:4/bytes>> = 
-    encryptPwBlockWithPasswordHash(NewPassword, PasswordHash),
-  EncPwBlock.
-
-encryptPwBlockWithPasswordHash(Password, <<PasswordHash:16/bytes>>)
-  when byte_size(Password) =< 256*2 ->
-  PwSize=byte_size(Password),
-
-  ClearPassword=crypto:rand_bytes(256*2),
-  ClearPasswordLen= <<PwSize:32>>,
-  PwOffset=byte_size(ClearPassword)-PwSize,
-
-  ClearHead=binary:part(ClearPassword, 0, PwOffset),
-  MixedPassword = <<ClearHead/binary, Password/binary>>,
-  ClearLen=byte_size(ClearPassword) + byte_size(ClearPasswordLen),
-  PwHashLen=byte_size(PasswordHash),
-
-  <<Cypher:ClearLen/bytes>> = 
-    rc4Encrypt(<<MixedPassword/binary, ClearPasswordLen/binary>>, ClearLen,
-               PasswordHash, PwHashLen),
-  Cypher.
-
-rc4Encrypt(Clear, ClearLen, Key, KeyLen) when
-    byte_size(Clear) == ClearLen andalso byte_size(Key) == KeyLen ->
-  S1=crypto:stream_init(rc4, Key),
-  {_, <<Cypher:ClearLen/bytes>>}=crypto:stream_encrypt(S1, Clear),
-  Cypher.
-
-oldNtPasswordHashEncryptedWithNewNtPasswordHash(NewPassword, OldPassword)
-  when byte_size(NewPassword) =< 256*2 andalso byte_size(OldPassword) =< 256*2 ->
-  <<OldPasswordHash:16/bytes>> = ntPasswordHash(OldPassword),
-  <<NewPasswordHash:16/bytes>> = ntPasswordHash(NewPassword),
-  <<EncryptedPwHash:16/bytes>> = ntPasswordHashEncryptedWithBlock(OldPasswordHash,
-                                                                 NewPasswordHash),
-  EncryptedPwHash.
-
-ntPasswordHashEncryptedWithBlock(<<PwHashFront:8/bytes, PwHashBack:8/bytes>>, <<Block:16/bytes>>) ->
-  <<R1:8/bytes>> = desEncrypt(PwHashFront, binary:part(Block, 0, 7)),
-  <<R2:8/bytes>> = desEncrypt(PwHashBack,  binary:part(Block, 7, 7)),
-  <<R1/binary, R2/binary>>.
+%%Currently unused:
+%newPasswordEncryptedWithOldNtPasswordHash(NewPassword, OldPassword)
+%  when byte_size(NewPassword) =< 256*2 andalso byte_size(OldPassword) =< 256*2 ->
+%  <<PasswordHash:16/bytes>> = ntPasswordHash(OldPassword),
+%  EncPwBlock = <<_:(256*2)/bytes, _:4/bytes>> =
+%    encryptPwBlockWithPasswordHash(NewPassword, PasswordHash),
+%  EncPwBlock.
+%
+%encryptPwBlockWithPasswordHash(Password, <<PasswordHash:16/bytes>>)
+%  when byte_size(Password) =< 256*2 ->
+%  PwSize=byte_size(Password),
+%
+%  ClearPassword=crypto:rand_bytes(256*2),
+%  ClearPasswordLen= <<PwSize:32>>,
+%  PwOffset=byte_size(ClearPassword)-PwSize,
+%
+%  ClearHead=binary:part(ClearPassword, 0, PwOffset),
+%  MixedPassword = <<ClearHead/binary, Password/binary>>,
+%  ClearLen=byte_size(ClearPassword) + byte_size(ClearPasswordLen),
+%  PwHashLen=byte_size(PasswordHash),
+%
+%  <<Cypher:ClearLen/bytes>> =
+%    rc4Encrypt(<<MixedPassword/binary, ClearPasswordLen/binary>>, ClearLen,
+%               PasswordHash, PwHashLen),
+%  Cypher.
+%
+%rc4Encrypt(Clear, ClearLen, Key, KeyLen) when
+%    byte_size(Clear) == ClearLen andalso byte_size(Key) == KeyLen ->
+%  S1=crypto:stream_init(rc4, Key),
+%  {_, <<Cypher:ClearLen/bytes>>}=crypto:stream_encrypt(S1, Clear),
+%  Cypher.
+%
+%oldNtPasswordHashEncryptedWithNewNtPasswordHash(NewPassword, OldPassword)
+%  when byte_size(NewPassword) =< 256*2 andalso byte_size(OldPassword) =< 256*2 ->
+%  <<OldPasswordHash:16/bytes>> = ntPasswordHash(OldPassword),
+%  <<NewPasswordHash:16/bytes>> = ntPasswordHash(NewPassword),
+%  <<EncryptedPwHash:16/bytes>> = ntPasswordHashEncryptedWithBlock(OldPasswordHash,
+%                                                                 NewPasswordHash),
+%  EncryptedPwHash.
+%
+%ntPasswordHashEncryptedWithBlock(<<PwHashFront:8/bytes, PwHashBack:8/bytes>>, <<Block:16/bytes>>) ->
+%  <<R1:8/bytes>> = desEncrypt(PwHashFront, binary:part(Block, 0, 7)),
+%  <<R2:8/bytes>> = desEncrypt(PwHashBack,  binary:part(Block, 7, 7)),
+%  <<R1/binary, R2/binary>>.
 
 %MSCHAPv2 test: (taken from RFC 2759, sec 9.2)
 run_test() ->
