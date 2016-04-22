@@ -33,10 +33,11 @@ Known issues:
   ssl_record.erl will be removed when a toggle for the BEAST mitigations
   makes it to upstream. See also:
   http://erlang.org/pipermail/erlang-questions/2012-August/068622.html
-* MPPE keys are not correctly calculated for TLS 1.1 or 1.2 supplicants.
-  NOTE: It's not currently clear if this is a problem with eapol_test or a
-        problem with Erlang's PRF for those modes. TLS 1.0 supplicants work
-        just fine.
+* The project contains modified versions of ssl_connection.erl
+  and ssl_handshake.erl from OTP 18.3. The TLS 1.1 and 1.2 PRF code was
+  assuming that the negotiated PRF would always be SHA256. This is not
+  true in either case. Those files (as well as the various supporting files)
+  will be removed as soon as a fix for the issue makes it upstream.
 * Loglevels are somewhat inappropriate.
 * Too little validation is done on incoming data.
 * Listen port, user credentials, and NAS secret are hard-coded.
