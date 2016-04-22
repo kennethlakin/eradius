@@ -20,7 +20,6 @@ start_link() ->
   gen_server:start_link({local, getName()}, ?MODULE, [], []).
 
 init(_) ->
-  process_flag(trap_exit, true),
   %FIXME: Make this port configurable.
   Port=1812,
   lager:info("RADIUS Listening on port ~p", [Port]),
@@ -38,9 +37,8 @@ handle_call({take_ownership, Pid, UdpSock}, _, UdpSock) ->
   {reply, Ret, UdpSock};
 handle_call(_, _, State) ->
   {reply, error, State}.
-terminate(_,UdpSock) ->
-  gen_udp:close(UdpSock).
 
+terminate(_,_) -> ok.
 handle_cast(_, _, State) -> {noreply, State}.
 handle_info(_, State) -> {noreply, State}.
 code_change(_, S, _) -> {ok, S}.

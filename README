@@ -5,8 +5,8 @@ It currently supports EAP-MD5, EAP-MSCHAPv2, and PEAPv0/1-MSCHAPv2.
 It shares no code with and is related only in function to the travelping/jungerl
 project of the same name.
 
-It has been tested with eapol_test and a couple of Android devices. It currently
-fails to work with Windows 7 and OS X supplicants.
+It has been tested with eapol_test, OS X 10.10.5, and a couple of Android devices.
+It currently fails to work with Windows 7 supplicants.
 
 Getting started:
 * Install rebar3 and put it on your PATH.

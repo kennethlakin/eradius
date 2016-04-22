@@ -2,6 +2,7 @@
 
 -compile([{parse_transform, lager_transform}]).
 -compile(export_all).
+-behavior(gen_server).
 
 connTableName() ->
   tls_udp_conn_table.
@@ -12,44 +13,15 @@ fakeSockTabName() ->
 start_link() ->
   gen_server:start_link({local, getName()}, ?MODULE, [], []).
 
-%FIXME: Change the free port allocation to work like this:
-%       tls_udp carries around a map of ip -> free ports structure that looks like
-%         ip -> queue() ports_in_use
-%            -> queue() ports_free
-%            -> integer() next_port_prealloc_start
-%            -> integer() port_alloc_chunk_size
-%
-%       This is used like so, when we want to find a free port:
-%       * if ip_not_in_map
-%         * insert into state:
-%             * IP
-%               * empty ports_in_use queue
-%               * ports_free queue loaded with 100 ports
-%               * next_port_prealloc_start (set to 101)
-%               * port_alloc_chunk_size (set to 100)
-%         * Return new state and proceed with subroutine
-%       * if ports_free queue is empty:
-%         * alloc port_alloc_chunk_size ports starting at next_port_prealloc_start
-%         * put those ports in to ports_free queue
-%         * increase port_alloc_chunk_size by 100 unless...
-%           If port_alloc_chunk_Size is at 1000, then it remains that size.
-%         * return new state and proceed with subroutine.
-%       * Pop off the next item in ports_free. Return it and the new state.
-locateFreePort(Ip, State) ->
-  locateFreePort(Ip, State, 0).
-locateFreePort(_, _, 65530) ->
-  {error, too_many_tries};
-locateFreePort(Ip, State=#{ipPortMap := Map}, Iters) ->
-  Port=crypto:rand_uniform(1,65535),
-  Key={Ip, Port},
-  case maps:is_key(Key, Map) of
-    false ->  {ok, Port};
-    true -> locateFreePort(Ip, State, Iters+1)
-  end.
-
 %Called by the TLS start helper code to start the process of starting a new TLS
+%connection.
 createNewServer(TlsMessageSink, PeerIp, Packet) ->
-  ok=gen_server:call(?MODULE:getName(), {eradius_handle_packet, TlsMessageSink, PeerIp, Packet}, infinity).
+  case gen_server:call(?MODULE:getName(), {eradius_handle_packet, TlsMessageSink, PeerIp, Packet}, infinity) of
+    ok -> ok;
+    Err ->
+      TlsMessageSink ! {tls_udp_server_start_error, Err},
+      Err
+  end.
 
 createFakeSockAndSignal(PeerIp, PeerPort) ->
   FakeSock=erlang:open_port({spawn_driver, "udp_inet"}, [binary]),
@@ -73,8 +45,8 @@ init(_) ->
   %Load our SSL certs and passwords for the same and such.
   {ok, App}=application:get_application(),
   Opts=application:get_env(App, ssl_opts, []),
-
   {ok, #{pidIpMap => #{}
+         ,freePortMap => #{}
          ,ipPortMap => #{}
          ,fakeSockMap => #{}
          ,sslOpts => Opts
@@ -93,39 +65,55 @@ handle_call({eradius_handle_packet, SinkPid, Addr, Data}, _From,
   case maps:get({SinkPid, Addr}, PidIpMap, undefined) of
     undefined ->
       lager:debug("TLS_UDP Starting TLS server for ~p ~p", [SinkPid, Addr]),
-      {ok, Port}=locateFreePort(Addr, State),
-      {ok, Pid}=startSslServerHelper(Addr, Port, SinkPid, SslOpts),
-      MonRef=monitor(process, Pid),
-      case waitForFakeSock(Addr, Port, MonRef, Pid) of
-        {ok, FakeSock} ->
-          case waitForSslPid(FakeSock, MonRef, Pid) of
-            {ok, SslPid} ->
-              case waitForTransToActive(FakeSock, MonRef, Pid) of
-                {error, proc_down} ->
-                  lager:error("TLS_UDP TLS startup process crashed, waiting to get set to active."),
-                  {reply, {error, proc_down}, State};
-                ok ->
-                  demonitor(MonRef, [flush]),
-                  SslPid ! {tls_udp, FakeSock, Data},
+      case getFreePort(Addr, State) of
+        {error, Reason} ->
+          {reply, {error, Reason}, State};
+        {ok, Port, NewState} ->
+          {ok, Pid}=startSslServerHelper(Addr, Port, SinkPid, SslOpts),
+          MonRef=monitor(process, Pid),
+          case waitForFakeSock(Addr, Port, MonRef, Pid) of
+            {ok, FakeSock} ->
+              case waitForSslPid(FakeSock, MonRef, Pid) of
+                {ok, SslPid} ->
+                  case waitForTransToActive(FakeSock, MonRef, Pid) of
+                    {error, proc_down} ->
+                      lager:error("TLS_UDP TLS startup process crashed, waiting to get set to active."),
+                      {reply, {error, proc_down}, NewState};
+                    ok ->
+                      demonitor(MonRef, [flush]),
+                      SslPid ! {tls_udp, FakeSock, Data},
 
-                  NewPIM=PidIpMap#{{SinkPid, Addr} => {SslPid, Port, FakeSock, undefined}},
-                  NewIPM=IpPortMap#{{Addr, Port} => ok},
-                  NewFSM=FakeSockMap#{FakeSock => {SinkPid, Addr}},
-                  {reply, ok, State#{pidIpMap := NewPIM, ipPortMap := NewIPM, fakeSockMap := NewFSM}}
+                      NewPIM=PidIpMap#{{SinkPid, Addr} => {SslPid, Port, FakeSock, undefined}},
+                      NewIPM=IpPortMap#{{Addr, Port} => ok},
+                      NewFSM=FakeSockMap#{FakeSock => {SinkPid, Addr}},
+                      {reply, ok, NewState#{pidIpMap := NewPIM, ipPortMap := NewIPM, fakeSockMap := NewFSM}}
+                  end;
+                {error, proc_down} ->
+                  lager:error("TLS_UDP SSL startup process crashed, waiting for TLS Pid."),
+                  {reply, {error, proc_down}, NewState}
               end;
             {error, proc_down} ->
-              lager:error("TLS_UDP SSL startup process crashed, waiting for TLS Pid."),
-              {reply, {error, proc_down}, State}
-          end;
-        {error, proc_down} ->
-          lager:error("TLS_UDP TLS startup proccess crashed, waiting for FakeSock."),
-          {reply, {error, proc_down}, State}
+              lager:error("TLS_UDP TLS startup proccess crashed, waiting for FakeSock."),
+              {reply, {error, proc_down}, NewState}
+          end
       end;
     {SslPid, _, FakeSock, _} ->
       lager:debug("TLS_UDP Found TLS server ~p. Using it", [SslPid]),
       SslPid ! {tls_udp, FakeSock, Data},
       {reply, ok, State}
   end.
+
+handle_cast({eradius_ssl_close, FakeSock}, State=#{fakeSockMap := FakeSockMap, ipPortMap := IpPortMap
+                                                   ,pidIpMap := PidIpMap}) ->
+  SA={_, Ip}=maps:get(FakeSock, FakeSockMap),
+  {_, Port, _, _}=maps:get(SA, PidIpMap),
+  NewFSM=maps:remove(FakeSock, FakeSockMap),
+  NewPIM=maps:remove(SA, PidIpMap),
+  NewIPM=maps:remove({Ip, Port}, IpPortMap),
+  {ok, NewState}=freePort(Ip, Port, State#{fakeSockMap := NewFSM, ipPortMap := NewIPM
+                                           ,pidIpMap := NewPIM}),
+  ets:delete(fakeSockTabName(), FakeSock),
+  {noreply, NewState}.
 
 handle_info({sslSock, FakeSock, SSLSock}, State=#{pidIpMap := PidIpMap, fakeSockMap := FakeSockMap}) ->
   PIKey={Pid, _}=maps:get(FakeSock, FakeSockMap),
@@ -149,20 +137,24 @@ start_worker([Addr, Port, SinkPid, Opts]) ->
   {ok, Pid}.
 
 startSslServer(Addr, Port, SslSinkPid, AddlOpts) ->
+  %Die if our SSL sink dies before ssl:ssl_accept returns.
+  link(SslSinkPid),
   FakeSock=createFakeSockAndSignal(Addr, Port),
   %NOTE:  tls_udp is the tag applied to the messages that the ssl module will
   %       handle. Not sure if it should be configurable.
   %%This works, but it requires intercommunication between the setopts function
   %%and the SSL server initialization code. That's in there, and it works, but
   %%it's not pretty.
-  Opts = [{cb_info, {?MODULE, tls_udp, closed, error}}] ++ AddlOpts,
+  Opts=[{cb_info, {?MODULE, tls_udp, closed, error}}] ++ AddlOpts,
   {ok, SSock}=ssl:ssl_accept(FakeSock, Opts),
+  unlink(SslSinkPid),
+  %Setting binary mode immediately to avoid a race that
+  %sometimes gave us data as lists.
+  ssl:setopts(SSock, [binary]),
+  ssl:controlling_process(SSock, SslSinkPid),
   %FIXME: Make this a proper call.
   ?MODULE:getName() ! {sslSock, FakeSock, SSock},
-  ssl:controlling_process(SSock, SslSinkPid),
-  %Set active to true to ensure that we get TLS packets as messages to our
-  %process mailbox, rather than having to call ssl:recv/2.
-  ssl:setopts(SSock, [{active, true}, binary]),
+  ssl:setopts(SSock, [{active, true}]),
   ok.
 
 waitForFakeSock(Addr, Port, MonRef, Pid) ->
@@ -198,6 +190,57 @@ getPid(Sock) ->
     [{Sock, #{pid := Pid}}] -> Pid
   end.
 
+%"Fake port" management functions
+freePort(Ip, Port, State=#{freePortMap := FreePortMap}) ->
+  #{portsInUse := PIU, portsFree := PF}=PortStruct=maps:get(Ip, FreePortMap),
+  NewPIU=lists:delete(Port, PIU),
+  NewPF=queue:in(Port, PF),
+  {ok, State#{freePortMap :=
+              FreePortMap#{Ip := PortStruct#{portsInUse := NewPIU, portsFree := NewPF}}}}.
+
+getFreePort(Ip, State=#{freePortMap := FreePortMap}) ->
+  case maps:get(Ip, FreePortMap, undefined) of
+    undefined ->
+      Port=1,
+      Chunk=100,
+      PortStruct=#{portsInUse => [Port]
+                   ,portsFree => queue:from_list(lists:seq(Port+1,Chunk))
+                   ,next => Chunk+1, chunk => Chunk},
+      {ok, Port, State#{freePortMap := FreePortMap#{Ip => PortStruct}}};
+    #{portsInUse := PortsInUse, portsFree := PortsFree} = PortStruct ->
+      case queue:is_empty(PortsFree) of
+        false ->
+          Port=queue:get(PortsFree),
+          NewFree=queue:drop(PortsFree),
+          NewInUse=[Port] ++ PortsInUse,
+          NewPortStruct=PortStruct#{portsInUse := NewInUse
+                                    ,portsFree := NewFree},
+          {ok, Port, State#{freePortMap := FreePortMap#{Ip := NewPortStruct}}};
+        true ->
+          case allocPorts(PortStruct) of
+            {ok, Port, NewPortStruct} ->
+              {ok, Port, State#{freePortMap := FreePortMap#{Ip := NewPortStruct}}};
+            {error, Reason} ->
+              {error, Reason}
+          end
+      end
+  end.
+
+allocPorts(#{next := Next}) when Next >= 65535 ->
+  {error, no_free_port};
+allocPorts(PortStruct=#{portsInUse := InUse, next := Next, chunk := Chunk}) ->
+  Port=Next,
+  NewInUse=[Port] ++ InUse,
+  NewFree=queue:from_list(
+            lists:seq(min(Next+1, 65535)
+                      ,min(Next+Chunk, 65535))),
+  NewNext=min(Next+Chunk, 65535),
+  NewChunk=min(Chunk*2, 1000),
+  {ok, Port, PortStruct#{portsInUse := NewInUse, portsFree := NewFree, next := NewNext
+                         ,chunk := NewChunk}}.
+%End "Fake port" management functions
+
+%inet:* socket functions required for fakesock
 getopts(Sock, Opts) ->
   case ets:lookup(fakeSockTabName(), Sock) of
     [] -> {error, einval};
@@ -283,14 +326,7 @@ listen(Sock, _) ->
   end.
 
 close(Sock) ->
-  %We do *not* need to close the fake port. erlang:ports/0 doesn't list
-  %it as a port. So, this is a port-shaped object, rather than a port.
-  %erlang:port_close(Sock),
-  %FIXME: Send a "cleanup" message to tls_udp server. It will trigger:
-  %       Lookup FakeSock to get {SinkPID, PeerIP}, then delete.
-  %       Look that up to get {SSLPid, Port, FakeSock, SSLSock}, then delete
-  %       Delete {PeerIp, Port}.
-  ets:delete(fakeSockTabName(), Sock),
+  gen_server:cast(getName(), {eradius_ssl_close, Sock}),
   ok.
 
 peername(Sock) ->
@@ -311,3 +347,6 @@ send(Sock, Packet) ->
     [{Sock, _}] ->
       gen_server:call(getName(), {send, Sock, Packet}, infinity)
   end.
+%End inet:* socket functions required for fakesock
+
+code_change(_, _, _) -> ok.

@@ -74,6 +74,9 @@ handle_cast(Msg={eradius_send_cyphertext, _}, State=#{fsm_pid := Pid}) ->
 handle_info(Msg={ssl, Socket, _}, State=#{socket := Socket, fsm_pid := FSMPid}) ->
   eap:handle_tls_data(FSMPid, Msg),
   {noreply, State};
+handle_info(Msg={tls_udp_server_start_error, _}, State=#{fsm_pid := FSMPid}) ->
+  eap:tls_server_start_error(FSMPid, Msg),
+  {noreply, State};
 handle_info({'EXIT', Pid, Reason}, State=#{fsm_pid := Pid}) ->
   {stop, Reason, State}.
 

@@ -25,7 +25,6 @@ start_link() ->
   gen_server:start_link({local, getName()}, ?MODULE, [], []).
 
 init(_) ->
-  process_flag(trap_exit, true),
   UdpSock=radius_sock:get_sock(),
   {ok, #{udp_sock => UdpSock}}.
 

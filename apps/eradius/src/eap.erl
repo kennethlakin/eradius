@@ -14,7 +14,12 @@ handle_tls_data(FSMPid, Msg={ssl, _Sock, _Data}) ->
 send_cyphertext(FSMPid, Msg={eradius_send_cyphertext, _Data}) ->
   gen_fsm:send_event(FSMPid, Msg).
 
+%Called when our TLS server is finally up and running.
 tls_up(FSMPid, Msg={tls_up, _RadState}) ->
+  gen_fsm:send_event(FSMPid, Msg).
+
+%If the TLS server fails to start, this gets called.
+tls_server_start_error(FSMPid, Msg={tls_udp_server_start_error, _}) ->
   gen_fsm:send_event(FSMPid, Msg).
 
 handlePacket(RadData={Ip, _Port, _Auth, _RadId, _Data, RadState}, #{eap_message := {EM, _}, message_authenticator := _}) ->
@@ -36,6 +41,7 @@ handlePacket(RadData={Ip, _Port, _Auth, _RadId, _Data, RadState}, #{eap_message 
             FsmPid;
           {error, work_entry_not_found} ->
             lager:info("EAP New conversation"),
+            ok=radius_server:insertWorkEntry(?MODULE, {Id, RadState, Ip}, working, undefined),
             {ok, FsmPid}=radius_worker:start(?MODULE, [DecodedMessage, RadData]),
             FsmPid
         end,
@@ -115,7 +121,7 @@ start_worker(Args) ->
   gen_fsm:start_link(?MODULE, Args, []).
 
 init([{_, Id, _, _, _}, {Ip, _, _, _, _, RadState}]) ->
-  ok=radius_server:insertWorkEntry(?MODULE, {Id, RadState, Ip}, working, self()),
+  ok=radius_server:updateWorkEntry(?MODULE, {Id, RadState, Ip}, working, self()),
   process_flag(trap_exit, true),
   State=getNewState(Id, RadState, Ip),
   {ok, starting, State}.
@@ -217,6 +223,15 @@ handleOuterPacket(From, Fun, Args) ->
       end
   end.
 
+running(rehandle_last_eap_packet, State=#{tx_credits := Credits
+                                                  ,last_rad := LastRad
+                                                  ,last_eap := LastEap})
+  when Credits == 1 ->
+  case running({handle, LastEap, LastRad}, undefined, State#{tx_credits := 0}) of
+    {reply, _, StateName, NS} ->
+      {next_state, StateName, NS};
+    Other -> Other
+  end;
 running(Msg={tls_up, _}, State=#{current_method := CurrMethod})
   when CurrMethod /= undefined ->
   %FIXME: Add a "lookup handler based on Method Name" function.
@@ -232,7 +247,9 @@ running(Msg={ssl, _, _}, State=#{current_method := CurrMethod})
   when CurrMethod /= undefined ->
   Fun=fun ?MODULE:CurrMethod/2,
   {ok, NS}=Fun(Msg, State),
-  {next_state, running, NS}.
+  {next_state, running, NS};
+running(Msg={tls_udp_server_start_error, _}, State) ->
+  {stop, {error, Msg}, State}.
 
 handleMethod(TypeOverride, {Task, {C, I, L, _, TD}, Rad}, State) ->
   handleMethod({Task, {C,I,L,TypeOverride,TD}, Rad}, State).
@@ -339,7 +356,9 @@ sendEapMessage(RadType, Type, EapMessageList, Id
   TheAttrs=maps:merge(Attrs, MPPEAttrs),
   Pkt=decode:encodeAccess(Ip, RadType, RadId, RadAuth, TheAttrs),
   lager:info("EAP Tx ~p bytes to ~p:~p", [erlang:iolist_size(EapMessageList), Ip, Port]),
-  radius_tx:send(Ip, Port, Pkt, RadData),
+  %NOTE: We might get the reply packet before we update our work entry...
+  %      So, when we go to insert the new work entry, there might already be an
+  %      EAP FSM working on it. So, update work entry data before transmitting.
   case NID of
     Id ->
       ok=radius_server:updateWorkEntry(?MODULE, {Id, RadState, Ip}, waiting, self());
@@ -347,6 +366,7 @@ sendEapMessage(RadType, Type, EapMessageList, Id
       ok=radius_server:insertWorkEntry(?MODULE, {NID, RadState, Ip}, waiting, self()),
       ok=radius_server:deleteWorkEntry(?MODULE, {Id, RadState, Ip})
   end,
+  radius_tx:send(Ip, Port, Pkt, RadData),
   {ok, State#{work_key => {NID, RadState, Ip}, tx_credits := Credits-1}}.
 
 incrementId(<<255>>) -> <<0>>;

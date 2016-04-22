@@ -53,13 +53,13 @@ handle({handle, {_, Id, _, _Type, TypeData},
         <<0:6, PeapVer:2>> ->
           lager:info("PEAPv~p Sending queued data", [PeapVer]),
           {send_queued, State};
-        <<LenIncluded:1, MoreFrags:1, Start:1, 0:3, _PeapVer:2, _/binary>> ->
+        <<LenIncluded:1, MoreFrags:1, Start:1, 0:3, PeapVer:2, _/binary>> ->
           case LenIncluded of
             1 -> 
-              <<LenIncluded:1, MoreFrags:1, Start:1, 0:3, _PeapVer:2, _TLSLen:4/bytes, Data/binary>> = TypeData;
+              <<LenIncluded:1, MoreFrags:1, Start:1, 0:3, PeapVer:2, _TLSLen:4/bytes, Data/binary>> = TypeData;
             0 ->
               _TLSLen=undefined,
-              <<LenIncluded:1, MoreFrags:1, Start:1, 0:3, _PeapVer:2, Data/binary>> = TypeData
+              <<LenIncluded:1, MoreFrags:1, Start:1, 0:3, PeapVer:2, Data/binary>> = TypeData
           end,
           lager:info("PEAPv~p Handling TLS Data ~p bytes", [PeapVer, byte_size(Data)]),
           #{tls_srv_pid := SrvPid} = State,
@@ -76,17 +76,24 @@ handle({handle, {_, Id, _, _Type, TypeData},
     inner_ident_sent ->
       %FIXME: Actually validate the TLS data (PEAP version included.)
       #{peap_ver := PeapVer}=MethodData,
-      <<LenIncluded:1, _:7, _/binary>> = TypeData,
-      case LenIncluded of
-        1 -> <<LenIncluded:1, _MoreFrags:1, _Start:1, 0:3, PeapVer:2, _TLSLen:4/bytes, Data/binary>> = TypeData;
+      <<LenIncluded:1, _:7, Rest/binary>> = TypeData,
+      case byte_size(Rest) of
         0 ->
-          _TLSLen=undefined,
-          <<LenIncluded:1, _MoreFrags:1, _Start:1, 0:3, PeapVer:2, Data/binary>> = TypeData
-      end,
-      lager:info("PEAPv~p Handling TLS Data ~p bytes", [PeapVer, byte_size(Data)]),
-      SrvPid=maps:get(tls_srv_pid, State),
-      eradius_peap_tls_srv:handlePacket(SrvPid, Ip, Data),
-      {send_queued, State};
+          lager:emergency("PEAPv~p ~p WARNING In state inner_ident_sent. Got something that's not a TLS record.",
+                          [PeapVer, self()]),
+          {send_queued, State};
+        _ ->
+          case LenIncluded of
+            1 -> <<LenIncluded:1, _MoreFrags:1, _Start:1, 0:3, PeapVer:2, _TLSLen:4/bytes, Data/binary>> = TypeData;
+            0 ->
+              _TLSLen=undefined,
+              <<LenIncluded:1, _MoreFrags:1, _Start:1, 0:3, PeapVer:2, Data/binary>> = TypeData
+          end,
+          lager:info("PEAPv~p Handling TLS Data ~p bytes", [PeapVer, byte_size(Data)]),
+          SrvPid=maps:get(tls_srv_pid, State),
+          eradius_peap_tls_srv:handlePacket(SrvPid, Ip, Data),
+          {send_queued, State}
+      end;
     inner_auth_success ->
       #{peap_ver := PeapVer}=MethodData,
       lager:info("PEAPv~p Inner auth success. Sending RADIUS success", [PeapVer]),
@@ -112,45 +119,33 @@ handle({tls_up, RadState}, State=#{current_method := peap
                                         ,peap := MethodData=
                                         #{peap_ver := PeapVer}})
   when RS == RadState ->
-  % So, PEAP, section 2.8. Key derivation:
-  %   This is how we'll do it on the server side:
-  % FirstPRF =ssl:prf(SSLSock, master_secret, "client PEAP encryption", [client_random, server_random], 128),
-  % SecondPRF=ssl:prf(SSLSock, <<"">>, "client PEAP encryption", [client_random, server_random], 64),
-  %   and then we continue as per the RFC.
-  %
-  % Okay.... So, PEAPv0 uses "client EAP encryption" as the string.
-  %              PEAPv1 uses "client PEAP encryption" as the string.
-  %          However... the documentation for wpa_supplicant.conf indicates
-  %          that many RADIUS servers work in PEAPv1 mode with
-  %          "client EAP encryption" as the string. In fact, using the
-  %          PEAPv0 string in PEAPv1 mode is the *DEFAULT* wpa_supplicant
-  %          configuration. So, keep this in mind. Becase we cannot *detect* a
-  %          keying mismatch, it might be safest to just use "client EAP encryption".
-  %          See:
-  %          https://w1.fi/cgit/hostap/plain/wpa_supplicant/wpa_supplicant.conf
-  %          for more info! This
-  %          https://w1.fi/cgit/hostap/plain/wpa_supplicant/eap_testing.txt
-  %          might also be of interest.
+  % So, PEAPv0 uses "client EAP encryption" as the string.
+  %     PEAPv1 uses "client PEAP encryption" as the string.
+  % However... the documentation for wpa_supplicant.conf indicates
+  % that many RADIUS servers work in PEAPv1 mode with
+  % "client EAP encryption" as the string. In fact, using the
+  % PEAPv0 string in PEAPv1 mode is the *DEFAULT* wpa_supplicant
+  % configuration. So, keep this in mind. Becase we cannot *detect* a
+  % keying mismatch, it might be safest to just use "client EAP encryption".
+  % See:
+  % https://w1.fi/cgit/hostap/plain/wpa_supplicant/wpa_supplicant.conf
+  % for more info! This
+  % https://w1.fi/cgit/hostap/plain/wpa_supplicant/eap_testing.txt
+  % might also be of interest.
   PEAPLabel= <<"client EAP encryption">>,
-  {ok, <<MSK:64/bytes, _:64/bytes>>}=eradius_peap_tls_srv:run_prf(SrvPid, master_secret, PEAPLabel,
-                                                                  [client_random, server_random], 128),
-  %FIXME: wpa_supplicant disagrees with us about the result of running the PRF
-  %       with the Master Secret as the secret, the above string as the label,
-  %       and the client random concatted with the server random.
-  %       So... not sure what's going on here. We can SEND and RECIEVE
-  %       encrypted data just fine! So, it's not like stuff's TOTALLY broken!
-  %       *grump*. Fix this after re-architecting the rest of the program to be
-  %       presentable. The only thing left to do to make PEAPv1/MSCHAPv2 work
-  %       for wpa_supplicant is to figure out this mystery... MPPE keys won't
-  %       get distributed if we can't agree on the output of our PRF!!!
-  %       FIXME: Maybe try the latest Erlang?
-  %       FIXME: No. Just tried 18.3 on a 64-bit machine. I get the same
-  %              problems; disagreement with PRF output and TLSv1.0
-  %              communications failure.
-  %       FIXME: Okay. The problem is with the TLS 1.1 and 1.2 PRF.
-  %              TLS 1.0 works just fine. Not clear if this is an issue w/
-  %              wpa_supplicant or with Erlang SSL.
+  {ok, <<MSK:64/bytes>>}=eradius_peap_tls_srv:run_prf(SrvPid, master_secret, PEAPLabel,
+                                                      [client_random, server_random], 64),
   lager:debug("PEAPv~p MSK is ~p", [PeapVer, radius_server:bin_to_hex(MSK)]),
+  %If we've gotten the TLS up message after our peer has requested more data,
+  %we need to reprocess the most recent EAP packet (which will be an empty PEAP
+  %packet).
+  #{tx_queue := TxQueue, tx_credits := TxCredits, peap := #{tls_queue := TlsQueue}} = State,
+  case TxCredits == 1 andalso TlsQueue == <<>> andalso queue:is_empty(TxQueue) of
+    true ->
+      lager:info("PEAPv~p Rehandling last EAP packet", [PeapVer]),
+      gen_fsm:send_event(self(), rehandle_last_eap_packet);
+    false -> ok
+  end,
   {ok, State#{tls_msk := MSK, peap := MethodData#{state := tls_up}}};
 
 %For wider compatiblity, enqueue the TLS records from ServerHello to
@@ -215,13 +210,21 @@ handle({eradius_send_cyphertext, D}, State=#{current_method := peap
   end,
   {ok, SN};
 
-handle({ssl, _SslSocket, SslData}, State=#{current_method := peap
+handle({ssl, SslSocket, SData}, State=#{current_method := peap
                                                ,tls_srv_pid := SrvPid
                                                ,last_rad := LastRad
                                                ,last_eap := LastEap={_, Id, _,_,_}
                                                ,peap := MethodState=
                                                #{peap_ver := PeapVer}})
   when is_pid(SrvPid) ->
+  case is_list(SData) of
+    true ->
+      lager:emergency("PEAPv~p WARNING Got SSL data as a LIST! Converting to binary. SSL Sock mode: ~p",
+                      [PeapVer, ssl:getopts(SslSocket, [mode])]),
+      SslData=binary:list_to_bin(SData);
+    false ->
+      SslData=SData
+  end,
   lager:info("PEAPv~p Handling ~p bytes tunneled plaintext", [PeapVer, byte_size(SslData)]),
   %FIXME: we really need to track the EAP IDs for the
   %inner and outer conversations separately.
