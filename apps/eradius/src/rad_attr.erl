@@ -114,6 +114,10 @@ encodeAttr(mschap_mppe_recv_key, D) when is_binary(D) ->
     50 -> {ok, <<26, 58, 311:32, 17, 52, D/binary>>};
     _ -> {error, data_length_incorrect}
   end;
+encodeAttr(session_timeout, D) ->
+  {ok, <<27, 6, D:32>>};
+encodeAttr(idle_timeout, D) ->
+  {ok, <<28, 6, D:32>>};
 encodeAttr(_, _) ->
   {warn, unrecognized_attr}.
 

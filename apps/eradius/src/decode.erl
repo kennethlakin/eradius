@@ -26,12 +26,9 @@ verifyAuthPlausibility(#{eap_message := _}) -> error;
 verifyAuthPlausibility(#{}) -> ok.
 
 %If we have an EAP-message, we MUST have a Message-Authenticator:
-verifyPacket(Addr,
+verifyPacket(NASSecret,
              _, #{message_authenticator := {[MsgAuth], AuthBin}},
              <<Type:1/bytes, Identifier:1/bytes, Len:2/bytes, ReqAuth:16/bytes, AttrBin/binary>>) ->
-
-  %FIXME: Look this up based on the NAS IP and other properties!
-  NASSecret=radius_server:nas_secret(Addr),
   BlankedAttrBin=zeroAttr(AttrBin, AuthBin),
   CalculatedAuth=crypto:hmac(md5, NASSecret,
                                  <<Type/binary, Identifier/binary, Len/binary,
@@ -44,9 +41,9 @@ verifyPacket(Addr,
   end;
 
 
-verifyPacket(Addr, Auth, #{user_password := {[MsgVerifier], _}
+verifyPacket(NASSecret, Auth, #{user_password := {[MsgVerifier], _}
              ,user_name := {[UserName], _}}, _) ->
-  Pass=radius_server:user_password(UserName),
+  {ok, Pass}=eradius_auth:lookup_user(UserName),
   PaddedPass=case byte_size(Pass) of
                Sz when Sz > 16 -> binary:part(Pass, 0, 16);
                Sz when Sz == 16 -> Pass;
@@ -54,7 +51,6 @@ verifyPacket(Addr, Auth, #{user_password := {[MsgVerifier], _}
                  Padding=binary:copy(<<0>>, 16-Sz),
                  <<Pass/binary, Padding/binary>>
              end,
-  NASSecret=radius_server:nas_secret(Addr),
   SharedSecretDigest=crypto:hash(md5, <<NASSecret/binary, Auth/binary>>),
   CalculatedVerifier=crypto:exor(SharedSecretDigest, PaddedPass),
   lager:debug("DECODE MsgVerifier  ~p", [MsgVerifier]),
@@ -89,7 +85,7 @@ determineLength(Code, Id, Auth, Attrs) ->
 encodeAccess(Addr, T, I, A) ->
   encodeAccess(Addr, T, I, A, #{}).
 encodeAccess(Addr, Type, Identifier, Auth, Attrs) ->
-  NASPassword=radius_server:nas_secret(Addr),
+  {ok, NASPassword}=eradius_auth:lookup_nas(Addr),
   case Type of
     access_request -> Code= <<1>>;
     access_accept -> Code= <<2>>;

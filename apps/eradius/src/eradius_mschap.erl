@@ -6,91 +6,102 @@
 
 -export([run_test/0]).
 
+handle({handle, {_, Id, _, _, _},
+    {_, _, _, _, _, _}},
+    State=#{mschapv2 := MethodData=#{state := undefined}}) ->
+  MSCHAPv2Bytes=crypto:strong_rand_bytes(16),
+  %It is not at all required to put a name in the challenge packet.
+  Name= <<"erlang.eap.server">>,
+  NewState=State#{mschapv2 := MethodData#{state := {challenge_sent, MSCHAPv2Bytes, Name}}},
+  NextId=eap:incrementId(Id),
+  BytesLen=byte_size(MSCHAPv2Bytes),
+  Data=create_packet(challenge, NextId, <<BytesLen, MSCHAPv2Bytes/binary, Name/binary>>),
+  lager:info("MSCHAP Tx challenge packet"),
+  lager:debug("MSCHAP Id ~p Challenge ~p Name ~p Len ~p",
+              [NextId, radius_server:bin_to_hex(MSCHAPv2Bytes), Name, BytesLen]),
+  {enqueue_and_send, {access_challenge, request, Data}, NewState};
 handle({handle, {_, Id, _, _Type, TypeData},
     {_, _, _, _, _, _}},
-    State=#{mschapv2 := MethodData=#{state := MethodState}}) ->
-  case MethodState of
-    undefined ->
-      MSCHAPv2Bytes=crypto:strong_rand_bytes(16),
-      %It is not at all required to put a name in the challenge packet.
-      Name= <<"erlang.eap.server">>,
-      NewState=State#{mschapv2 := MethodData#{state := {challenge_sent, MSCHAPv2Bytes, Name}}},
-      NextId=eap:incrementId(Id),
-      BytesLen=byte_size(MSCHAPv2Bytes),
-      Data=create_packet(challenge, NextId, <<BytesLen, MSCHAPv2Bytes/binary, Name/binary>>),
-      lager:info("MSCHAP Tx challenge packet"),
-      lager:debug("MSCHAP Id ~p Challenge ~p Name ~p Len ~p",
-                  [NextId, radius_server:bin_to_hex(MSCHAPv2Bytes), Name, BytesLen]),
-      {enqueue_and_send, {access_challenge, request, Data}, NewState};
-    %NOTE: This message might be useful if the Mac machine continues to be dumb
-    %when the RADIUS credentials have changed out from under it:
-    %http://lists.freeradius.org/pipermail/freeradius-users/2011-April/053010.html
-    {challenge_sent, AuthChallenge, _Name} ->
-      %Reserved and Flags both must be zero-filled. (RFC2759)
-      Reserved=binary:copy(<<0>>, 8),
-      Flags= <<0>>,
-      case TypeData of
-        %Response packet.
-        %FIXME: Use ChapLen and ValueSize to verify the packet!
-        <<2, Id:1/bytes, _ChapLen:2/bytes, _ValueSize:1/bytes,
-          PeerChallenge:16/bytes, Reserved:8/bytes, NtResponse:24/bytes, Flags:1/bytes,
-          %FIXME: This username might have a WinNT domain part. Ignore up to and
-          %including the first "\", and then the rest is the username.
-          ChapUserName/binary>> ->
-          lager:info("MSCHAP Rx challenge response"),
-          lager:debug("MSCHAP UserName ~p PeerChallenge ~p NtResponse ~p Flags ~p",
-                      [ChapUserName, radius_server:bin_to_hex(PeerChallenge)
-                       ,radius_server:bin_to_hex(NtResponse), Flags]),
-          Password=maps:get(user_pass, State),
+    State=#{mschapv2 := MethodData=#{state := {challenge_sent, AuthChallenge, _Name}}}) ->
+  %Reserved and Flags both must be zero-filled. (RFC2759)
+  Reserved=binary:copy(<<0>>, 8),
+  Flags=0,
+  case TypeData of
+    %Response packet.
+    %FIXME: Use ChapLen and ValueSize to verify the packet!
+    <<2, Id:1/bytes, _ChapLen:2/bytes, _ValueSize:1/bytes,
+      PeerChallenge:16/bytes, Reserved:8/bytes, NtResponse:24/bytes, Flags,
+      ChapUserName/binary>> ->
+      lager:info("MSCHAP Rx challenge response"),
+      lager:debug("MSCHAP UserName ~p PeerChallenge ~p NtResponse ~p",
+                  [ChapUserName, radius_server:bin_to_hex(PeerChallenge)
+                   ,radius_server:bin_to_hex(NtResponse)]),
+      %Find and remove the WinNT Domain part, if present.
+      case binary:match(ChapUserName, <<"\\">>) of
+        nomatch -> UserName=ChapUserName;
+        {Pos, Sz} ->
+          lager:debug("Found WinNT Domain part in username. Removing it."),
+          <<_NTDomain:Pos/bytes, _:Sz/bytes, UserName/binary>> = ChapUserName
+      end,
+      %FIXME: Add a retry counter that eventually sends a non-retryable
+      %       failure.
+      case eradius_auth:lookup_user(UserName) of
+        {error, not_found} ->
+          lager:notice("MSCHAP Username not found."),
+          lager:debug("MSCHAP Username ~p ~p", [ChapUserName, UserName]),
+          lager:info("MSCHAP Tx failure packet"),
+          %FIXME: It's not entirely clear what the best approach is here. OS X
+          %       has the only GUI that consistently does something reasonable
+          %       when auth fails. For now, we send a retryable 647
+          %       (ERROR_ACCT_DISABLED)
+          FP=create_packet(failure, Id, 647, true, AuthChallenge, <<>>),
+          {enqueue_and_send, {access_challenge, request, FP}, State};
+        {ok, Password} ->
           %Convert password from UTF8 to UTF16-LE:
           ConvertedPass=unicode:characters_to_binary(Password,
                                                      utf8, {utf16, little}),
           CalculatedReponse=eradius_mschap:generateNtResponse(AuthChallenge, PeerChallenge,
-                                                              ChapUserName, ConvertedPass),
+                                                              UserName, ConvertedPass),
           case CalculatedReponse == NtResponse of
             true ->
               lager:info("MSCHAP Challenge response valid"),
               AuthResp=eradius_mschap:generateAuthenticatorResponse(ConvertedPass, NtResponse, PeerChallenge,
-                                                                    AuthChallenge, ChapUserName),
-              NextId=eap:incrementId(Id),
+                                                                    AuthChallenge, UserName),
               Message= <<>>,
-              Data=create_packet(success, NextId, AuthResp, Message),
-              NewState=State#{mschapv2 := MethodData#{state => {mschap_success_sent, AuthChallenge, _Name}}},
+              Data=create_packet(success, Id, AuthResp, Message),
+              NewState=State#{mschapv2 := MethodData#{state => mschap_success_sent}},
               lager:info("MSCHAP Tx MSCHAP success"),
               lager:debug("MSCHAP Id ~w AuthResponse ~p Message ~p Packet ~p",
-                          [NextId, radius_server:bin_to_hex(AuthResp)
+                          [Id, radius_server:bin_to_hex(AuthResp)
                            ,radius_server:bin_to_hex(Message), radius_server:bin_to_hex(Data)]),
               {enqueue_and_send, {access_challenge, request, Data}, NewState};
             false ->
-              %FIXME: If the username is correct, then the password is invalid.
-              %       Send a retryable error with code 691 and wait for another message.
-              %       If the username is incorrect, then all auth here is
-              %       invalid. MAYBE send a non-retryable error with code 691
-              %       and PROBABLY END the session.
               lager:notice("MSCHAP Challenge response invalid"),
               lager:debug("MSCHAP Peer NtResponse ~p Correct NtResponse ~p",
                           [radius_server:bin_to_hex(NtResponse)
                            ,radius_server:bin_to_hex(CalculatedReponse)]),
-              %FIXME: See above. This data should be sensible!
-              %       Also, we shouldn't reject outright!
-              NextId=eap:incrementId(Id),
-              lager:info("MSCHAP Tx failure packet"),
-              %FIXME: Actually send the fail packet.
-              _FailPacket=create_packet(failure, NextId, 691, true, AuthChallenge, <<>>),
-              {enqueue_and_send, {access_reject, failure, <<>>}, State}
-          end;
-        _ ->
-          lager:notice("MSCHAP Malformed packet"),
-          lager:debug("MSCHAP Packet ~p", [radius_server:bin_to_hex(TypeData)]),
-          {ignore, bad_packet, State}
+              lager:info("MSCHAP Tx auth retry packet"),
+              %If the username is valid, but the password is not, send a
+              %retryable 691 (ERROR_AUTHENTICATION_FAILURE)
+              FailPacket=create_packet(failure, Id, 691, true, AuthChallenge, <<>>),
+              {enqueue_and_send, {access_challenge, request, FailPacket}, State}
+          end
       end;
-    {mschap_success_sent, _AuthChallenge, _Name} ->
-      case TypeData of
-        <<3>> ->
-          lager:info("MSCHAP Tx RADIUS success"),
-          {auth_ok, {access_accept, success, <<>>}, State}
-      end
-  end.
+    _ ->
+      lager:notice("MSCHAP Malformed packet"),
+      lager:debug("MSCHAP Packet ~p", [radius_server:bin_to_hex(TypeData)]),
+      {ignore, bad_packet, State}
+  end;
+handle({handle, {_, _, _, _, <<3>>},
+    {_, _, _, _, _, _}},
+    State=#{mschapv2 := #{state := mschap_success_sent}}) ->
+  lager:info("MSCHAP Tx RADIUS success"),
+  {auth_ok, {access_accept, success, <<>>}, State};
+handle({handle, {_, _, _, _, <<4>>},
+    {_, _, _, _, _, _}},
+    State=#{mschapv2 := #{state := mschap_failure_sent}}) ->
+  lager:info("MSCHAP Tx RADIUS failure"),
+  {auth_fail, {access_reject, failure, <<>>}, State}.
 
 %TODO: Note: Everything in this module only handles MSCHAPv2, despite the
 %      module name. Adding support for older versions of MSCHAP is on the TODO

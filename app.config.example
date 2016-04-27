@@ -8,5 +8,7 @@
    ,{src_dirs,
       {replace, [{"./apps/eradius/src", [{outdir, "./_build/default/lib/eradius/ebin"}]}]}}
    ]}
- ,{eradius, [{ssl_opts, [{cacertfile, "ca.pem"}, {certfile, "server.pem"}]}]}
+ ,{eradius, [{ssl_opts, [{cacertfile, "ca.pem"}, {certfile, "server.pem"}
+                         ,{beast_mitigation, zero_n} %Set to one_n_minus_one or disabled as needed.
+                         ]}]}
 ].

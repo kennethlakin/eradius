@@ -5,8 +5,8 @@ It currently supports EAP-MD5, EAP-MSCHAPv2, and PEAPv0/1-MSCHAPv2.
 It shares no code with and is related only in function to the travelping/jungerl
 project of the same name.
 
-It has been tested with eapol_test, OS X 10.10.5, and a couple of Android devices.
-It currently fails to work with Windows 7 supplicants.
+It has been tested with eapol_test, OS X 10.10.5, Windows 7, and a couple of
+Android devices.
 
 Getting started:
 * Install rebar3 and put it on your PATH.
@@ -14,6 +14,7 @@ Getting started:
   * The contents of the eradius ssl_opts list are passed to ssl:ssl_accept/2. Modify
     the list as required to point to your SSL certificates and include any password
     required to unlock them.
+* Copy credentials.example to credentials
 * Run make (or rebar3 compile) to fetch deps and build the project.
 * Run "make start" to start the server. Run "make watch" to start the server
   as well as rustyio's sync auto-recompiler.
@@ -34,18 +35,15 @@ Known issues:
   version of the ssl application.
 * Loglevels are somewhat inappropriate.
 * Too little validation is done on incoming data.
-* Listen port, user credentials, and NAS secret are hard-coded.
+* Listen port is hard-coded.
 * RADIUS packet handler crashes rather than sending an Access-Reject if sent
   a non-EAP packet.
-* MSCHAPv2 authentication failure terminates the EAP conversation rather than
-  presenting the option of retrying authentication.
 * Very little validation is performed on PEAP packets. No validation is
   performed on TLS payloads in PEAP packets.
 * TLS messages transmited by the NAS that are split across multiple RADIUS
   packets will not be handled correctly. The PEAP handling code needs to
   check for this condition and accumulate the complete TLS packet before
   sending it off to the TLS handler.
-* Windows 7's PEAP and MSCHAPv2 quirks are not yet handled.
 
 License:
 All code in the project is released under the terms of the GPLv2 or later.

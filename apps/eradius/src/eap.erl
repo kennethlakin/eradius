@@ -347,8 +347,12 @@ sendEapMessage(RadType, Type, EapMessageList, Id
             MasterSendCryptKey=binary:part(MSK, 0, 32 ),
             <<RecvKey:50/bytes>> =radius_server:scramble_mppe_key(MasterRecvCryptKey, LastRad),
             <<SendKey:50/bytes>> =radius_server:scramble_mppe_key(MasterSendCryptKey, LastRad),
+            %FIXME: Hard-coding idle and session timeouts! These should be not
+            %       only configurable, but passed in!
             #{mschap_mppe_send_key => [RecvKey]
-              ,mschap_mppe_recv_key => [SendKey]}
+              ,mschap_mppe_recv_key => [SendKey]
+              ,session_timeout => [600]
+              ,idle_timeout => [10]}
         end;
       _ ->
         #{}

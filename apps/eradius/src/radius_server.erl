@@ -84,12 +84,6 @@ handle_info({udp_passive, Sock}, State=#{udp_sock := Sock}) ->
   lager:debug("RADIUS All workers busy"),
   {noreply, State}.
 
-%FIXME: Make these configurable.
-nas_secret(_) ->
-  <<"password">>.
-user_password(_) ->
-  <<"pass">>.
-
 %Work table management:
 insertWorkEntry(Mod, Key, Status, Pid) ->
   Now=erlang:monotonic_time(),
@@ -172,7 +166,7 @@ trimErlangTags(<<131, 111, _:4/bytes, Num/binary>>) -> Num.
 %Called to turn a EAP-TLS-derived Master Key into an MS-MPPE-*-Key payload.
 %From RFC 2548 sec 2.4.2
 scramble_mppe_key(<<Key:32/bytes>>, {Ip,_,RadAuth,_,_,_}) ->
-  NasSecret=radius_server:nas_secret(Ip),
+  {ok, NasSecret}=eradius_auth:lookup_nas(Ip),
   <<_:1, BaseSalt:15>> =crypto:rand_bytes(2),
   Salt= <<1:1,BaseSalt:15>>,
   Padding=binary:copy(<<0>>, 15),

@@ -96,7 +96,7 @@ handle({handle, {_, Id, _, _Type, TypeData},
       end;
     inner_auth_success ->
       #{peap_ver := PeapVer}=MethodData,
-      lager:info("PEAPv~p Inner auth success. Sending RADIUS success", [PeapVer]),
+      lager:info("PEAPv~p Inner auth success. Sending RADIUS accept", [PeapVer]),
       true=eap:txQueueIsEmpty(State),
       %FIXME: ACTUALLY! because we are doing MSCHAPv2, we should send
       %       a MS-MPPE-Recv-Key   and   MS-MPPE-Send-Key
@@ -110,7 +110,12 @@ handle({handle, {_, Id, _, _Type, TypeData},
       %   BUT. For now, we can detect if we're being passed an
       %   ACCEPT/SUCCESS packet with 0 EAP messages and just insert the
       %   data there... just to test the feasibility.
-      {auth_ok, {access_accept, success, <<>>}, State}
+      {auth_ok, {access_accept, success, <<>>}, State};
+    inner_auth_failure ->
+      #{peap_ver := PeapVer}=MethodData,
+      lager:info("PEAPv~p Inner auth failure. Sending RADIUS reject", [PeapVer]),
+      true=eap:txQueueIsEmpty(State),
+      {auth_fail, {access_reject, failure, <<>>}, State}
   end;
 handle({tls_up, RadState}, State=#{current_method := peap
                                         ,last_rad := {_,_,_,_,_,RS}

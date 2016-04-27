@@ -21,30 +21,37 @@ init(S={_,_,_,_}) ->
 
 handle_info(timeout, State={Addr, Port, Data, _}) ->
   radius_server:insertWorkEntry(?MODULE, {Addr, Port, Data}, working, self()),
-  case radius_tx:findCachedEntry(Addr, Port, Data) of
-    {ok, {_, Pkt}} ->
-      lager:info("RADIUS Packet is retransmission. Using cache"),
-      radius_tx:resend(Addr, Port, Pkt);
-    none ->
-      DecRet=decode:decodeRadius(Data),
-      case DecRet of
-        {ok, Rad={_,_,_,_,_,Rest}} ->
-          case decode:decodeAttributes(Rest) of
-            {ok, Attrs} ->
-              lager:debug("RADIUS Attrs decoded ~p", [Attrs]),
-              handlePacket(Addr, Port, Rad, Attrs, Data);
-            {error, R} ->
-              lager:notice("RADIUS Attr decode error ~p", [R])
-          end;
-        {discard, _} ->
-          %FIXME: Increment a discard counter. Discriminate between the various
-          %       reasons why we might discard a packet.
-          ok
+  case eradius_auth:lookup_nas(Addr) of
+    {error, not_found} ->
+      %FIXME: Add statistics?
+      lager:notice("RADIUS Dropping packet because from unrecognized NAS"),
+      lager:debug("RADIUS NAS ~p", [Addr]);
+    {ok, NASSecret} ->
+      case radius_tx:findCachedEntry(Addr, Port, Data) of
+        {ok, {_, Pkt}} ->
+          lager:info("RADIUS Packet is retransmission. Using cache"),
+          radius_tx:resend(Addr, Port, Pkt);
+        none ->
+          DecRet=decode:decodeRadius(Data),
+          case DecRet of
+            {ok, Rad={_,_,_,_,_,Rest}} ->
+              case decode:decodeAttributes(Rest) of
+                {ok, Attrs} ->
+                  lager:debug("RADIUS Attrs decoded ~p", [Attrs]),
+                  handlePacket(NASSecret, Addr, Port, Rad, Attrs, Data);
+                {error, R} ->
+                  lager:notice("RADIUS Attr decode error ~p", [R])
+              end;
+            {discard, _} ->
+              %FIXME: Increment a discard counter. Discriminate between the various
+              %       reasons why we might discard a packet.
+              ok
+          end
       end
   end,
   {stop, normal, State}.
 
-handlePacket(Addr, Port, {_, _, Id, _, Auth, _}, Attrs, Data) ->
+handlePacket(NASSecret, Addr, Port, {_, _, Id, _, Auth, _}, Attrs, Data) ->
   NextStep=radius_server:determineWhatToDo(Attrs),
   lager:debug("RADIUS We got a ~p request", [NextStep]),
   %FIXME: The checking done in verifyAuthPlausibility only makes sense
@@ -53,7 +60,7 @@ handlePacket(Addr, Port, {_, _, Id, _, Auth, _}, Attrs, Data) ->
     error ->
       lager:notice("RADIUS Dropping packet because illegal auth attr combination");
     ok ->
-      case decode:verifyPacket(Addr, Auth, Attrs, Data) of
+      case decode:verifyPacket(NASSecret, Auth, Attrs, Data) of
         error ->
           lager:notice("RADIUS Packet verification failed");
         ok ->

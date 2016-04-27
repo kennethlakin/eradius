@@ -12,6 +12,8 @@ init([]) ->
                                   ,start => {tls_udp, start_link, []}}
                                ,#{id => radius_tx:getName()
                                   ,start => {radius_tx, start_link, []}}
+                               ,#{id => eradius_auth:getName()
+                                  ,start => {eradius_auth, start_link, []}}
                                ,#{id => cache_cleaner:getName()
                                   ,start => {eradius_app, createChild, [{cache_cleaner, loop, [CacheCleanerTimeout]}]}}
                                ,#{id => radius_server_sup:getName()
