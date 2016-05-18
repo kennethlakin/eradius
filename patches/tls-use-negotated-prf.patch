@@ -1,0 +1,58 @@
+diff --git a/lib/ssl/src/ssl_connection.erl b/lib/ssl/src/ssl_connection.erl
+index f774873..0f0072b 100644
+--- a/lib/ssl/src/ssl_connection.erl
++++ b/lib/ssl/src/ssl_connection.erl
+@@ -821,7 +821,8 @@ handle_sync_event({prf, Secret, Label, Seed, WantedLength}, _, StateName,
+     SecParams = ConnectionState#connection_state.security_parameters,
+     #security_parameters{master_secret = MasterSecret,
+ 			 client_random = ClientRandom,
+-			 server_random = ServerRandom} = SecParams,
++			 server_random = ServerRandom,
++			 prf_algorithm = PRFAlgorithm} = SecParams,
+     Reply = try
+ 		SecretToUse = case Secret of
+ 				  _ when is_binary(Secret) -> Secret;
+@@ -832,7 +833,7 @@ handle_sync_event({prf, Secret, Label, Seed, WantedLength}, _, StateName,
+ 					     (client_random, Acc) -> [ClientRandom|Acc];
+ 					     (server_random, Acc) -> [ServerRandom|Acc]
+ 					  end, [], Seed)),
+-		ssl_handshake:prf(Version, SecretToUse, Label, SeedToUse, WantedLength)
++		ssl_handshake:prf(Version, PRFAlgorithm, SecretToUse, Label, SeedToUse, WantedLength)
+ 	    catch
+ 		exit:_ -> {error, badarg};
+ 		error:Reason -> {error, Reason}
+diff --git a/lib/ssl/src/ssl_handshake.erl b/lib/ssl/src/ssl_handshake.erl
+index 644903c..235d6ef 100644
+--- a/lib/ssl/src/ssl_handshake.erl
++++ b/lib/ssl/src/ssl_handshake.erl
+@@ -72,7 +72,7 @@
+ 	]).
+ 
+ %% MISC
+--export([select_version/3, prf/5, select_hashsign/3, 
++-export([select_version/3, prf/6, select_hashsign/3,
+ 	 select_hashsign_algs/2, select_hashsign_algs/3,
+ 	 premaster_secret/2, premaster_secret/3, premaster_secret/4]).
+ 
+@@ -564,17 +564,15 @@ server_key_exchange_hash(md5sha, Value) ->
+ server_key_exchange_hash(Hash, Value) ->
+     crypto:hash(Hash, Value).
+ %%--------------------------------------------------------------------
+--spec prf(ssl_record:ssl_version(), binary(), binary(), [binary()], non_neg_integer()) ->
++-spec prf(ssl_record:ssl_version(), non_neg_integer(), binary(), binary(), [binary()], non_neg_integer()) ->
+ 		 {ok, binary()} | {error, undefined}.
+ %%
+ %% Description: use the TLS PRF to generate key material
+ %%--------------------------------------------------------------------
+-prf({3,0}, _, _, _, _) ->
++prf({3,0}, _, _, _, _, _) ->
+     {error, undefined};
+-prf({3,1}, Secret, Label, Seed, WantedLength) ->
+-    {ok, tls_v1:prf(?MD5SHA, Secret, Label, Seed, WantedLength)};
+-prf({3,_N}, Secret, Label, Seed, WantedLength) ->
+-    {ok, tls_v1:prf(?SHA256, Secret, Label, Seed, WantedLength)}.
++prf({3,_N}, PRFAlgo, Secret, Label, Seed, WantedLength) ->
++    {ok, tls_v1:prf(PRFAlgo, Secret, Label, Seed, WantedLength)}.
+ 
+ 
+ %%--------------------------------------------------------------------

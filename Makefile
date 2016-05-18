@@ -2,7 +2,9 @@ EPMD_ADDRESS=ERL_EPMD_ADDRESS=""
 NODE_NAME=eradius
 MONITOR_NODE_NAME=eradius-observer
 ERL_BASE=$(EPMD_ADDRESS) erl
-BASE_ARGS=+C multi_time_warp +K true -name $(NODE_NAME) -mnesia dir "'db-$(NODE_NAME)'" -mnesia dump_log_write_threshold 1000
+#NOTE: SSL_OVERRIDE is here to force our local, patched copy of ssl to load first. This will remain until PRF and BEAST patches make it into OTP.
+SSL_OVERRIDE=-pa ./_build/default/lib/ssl/ebin
+BASE_ARGS=$(SSL_OVERRIDE) +C multi_time_warp +K true -name $(NODE_NAME) -mnesia dir "'db-$(NODE_NAME)'" -mnesia dump_log_write_threshold 1000
 
 all:
 	rebar3 compile

@@ -26,18 +26,12 @@ Dependencies:
 rebar3 handles dependency fetching and compilation.
 
 Known issues:
-* The project contains a copy of ssl_record.erl from OTP 18.3. The BEAST 
-  mitigation added to OTP in commits f1f1d43 and fc668fb freaks out all
-  TLS 1.0 supplicants I've tested with. With the BEAST mitigation disabled,
-  Android, eapol_test, and Windows 7 supplicants work correctly. The copy of 
-  ssl_record.erl will be removed when a toggle for the BEAST mitigations
-  makes it to upstream. See also:
-  http://erlang.org/pipermail/erlang-questions/2012-August/068622.html
-* The project contains modified versions of ssl_connection.erl
-  and ssl_handshake.erl from OTP 18.3. The TLS 1.1 and 1.2 PRF code was
-  assuming that the negotiated PRF would always be SHA256. This is not
-  true in either case. Those files (as well as the various supporting files)
-  will be removed as soon as a fix for the issue makes it upstream.
+* The project contains a patched copy of the ssl application from
+  OTP 18.3. Patches applied are the "Use negotiated PRF for ssl:prf"
+  patch that has landed in OTP 19 and the "Add three-way toggle for
+  BEAST mitigation strategy" patch that is currently under consideration.
+  The patches are in patches/ if you wish to apply them to a different
+  version of the ssl application.
 * Loglevels are somewhat inappropriate.
 * Too little validation is done on incoming data.
 * Listen port, user credentials, and NAS secret are hard-coded.

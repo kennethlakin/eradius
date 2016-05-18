@@ -1,6 +1,6 @@
 {application, ssl,
    [{description, "Erlang/OTP SSL application"},
-    {vsn, "%VSN%"},
+    {vsn, "7.3-prf-and-BEAST-patches"},
     {modules, [
 	       %% TLS/SSL 
 	       tls_connection,
