@@ -46,4 +46,7 @@ Known issues:
   sending it off to the TLS handler.
 
 License:
-All code in the project is released under the terms of the GPLv2 or later.
+All code in the project is released under the terms of the GPLv2 or later,
+with the exception of the bundled OTP ssl application. That code (and the
+patches applied to it) is released under the terms of the Apache License
+2.0.

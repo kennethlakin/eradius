@@ -1,0 +1,3 @@
+Because beast-mitigation-selection-method.patch and tls-use-negotated-prf.patch
+have been submitted for inclusion in OTP, they are both released under the terms
+of the Apache License 2.0.
