@@ -167,7 +167,7 @@ trimErlangTags(<<131, 111, _:4/bytes, Num/binary>>) -> Num.
 %From RFC 2548 sec 2.4.2
 scramble_mppe_key(<<Key:32/bytes>>, {Ip,_,RadAuth,_,_,_}) ->
   {ok, NasSecret}=eradius_auth:lookup_nas(Ip),
-  <<_:1, BaseSalt:15>> =crypto:rand_bytes(2),
+  <<_:1, BaseSalt:15>> =crypto:strong_rand_bytes(2),
   Salt= <<1:1,BaseSalt:15>>,
   Padding=binary:copy(<<0>>, 15),
   <<Plain:48/bytes>> = <<32, Key/binary, Padding/binary>>,

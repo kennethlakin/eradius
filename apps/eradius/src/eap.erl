@@ -88,7 +88,15 @@ decodeMessage(P = <<Code:1/bytes, ID:1/bytes, L:2/bytes, Type:1/bytes, _/binary>
   end.
 
 getNewState(Id, RadState, Ip) ->
+  %Version 8.0 (OTP-19.0) of the ssl module added automatic TLS handshake
+  %record batching. For earlier versions, we have to perform the batching
+  %ourselves.
+  {_,_,SslVer}=lists:keyfind(ssl, 1, application:which_applications()),
+  {VerMaj,_}=string:to_integer(lists:nth(1, string:tokens(SslVer, "."))),
+  HandshakeBatching=VerMaj < 8,
+  lager:debug("EAP Running with ssl app version ~p. Doing TLS handshake batching? ~w", [SslVer,HandshakeBatching]),
   #{ work_key => {Id, RadState, Ip}
+     ,do_tls_handshake_batching => HandshakeBatching
      %FIXME: Make this configurable!
      ,default_method => md5
      %FIXME: Make this configurable!

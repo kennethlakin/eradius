@@ -157,16 +157,21 @@ handle({tls_up, RadState}, State=#{current_method := peap
 %ServerHelloDone, then send them in one batch. The spec says that we
 %can send them spread across many messages, but many supplicants
 %don't seem to like that very much.
+%NOTE: OTP-19.0 (and presumably later) do this batching automatically.
 handle({eradius_send_cyphertext, D}, State=#{current_method := peap
+                                             ,do_tls_handshake_batching := Batching
                                              ,peap := MethodData=#{tls_state := server_hello_not_done
                                                                    ,peap_ver := PeapVer
                                                                    ,tls_queue := TlsQueue}}) ->
   Data= iolist_to_binary(D),
   NewQueue= <<TlsQueue/binary, Data/binary>>,
   <<22, _:4/bytes, MsgType:1/bytes, _/binary>> = Data,
-  case MsgType of
-    <<14>> ->
-      lager:debug("PEAPv~p ServerHelloDone found. Tx backlog", [PeapVer]),
+  case Batching == false orelse MsgType == <<14>> of
+    true ->
+      case Batching of
+        false -> ok;
+        true -> lager:debug("PEAPv~p ServerHelloDone found. Tx backlog", [PeapVer])
+      end,
       {Ret, NS}=handle({eradius_send_cyphertext, NewQueue},
                        State#{peap := MethodData#{tls_state := server_hello_sending
                                                   ,tls_queue := <<>>}}),
@@ -180,16 +185,21 @@ handle({eradius_send_cyphertext, D}, State=#{current_method := peap
 %FIXME: This queueing is probably fragile and may break if we do
 %       certificate authentication or anything else we haven't tried yet.
 %       Double-check the TLS docs.
+%NOTE: OTP-19.0 (and presumably later) do this queueing automatically.
 handle({eradius_send_cyphertext, D}, State=#{current_method := peap
+                                             ,do_tls_handshake_batching := Batching
                                              ,peap := MethodData=#{tls_state := server_hello_done
                                                                    ,peap_ver := PeapVer
                                                                    ,tls_queue := TlsQueue}}) ->
   Data= iolist_to_binary(D),
   NewQueue= <<TlsQueue/binary, Data/binary>>,
   <<ContentType:1/bytes, _/binary>> = Data,
-  case ContentType of
-    <<22>> ->
-      lager:debug("PEAPv~p ServerHandshake found. Tx backlog", [PeapVer]),
+  case Batching == false orelse ContentType == <<22>> of
+    true ->
+      case Batching of
+        false -> ok;
+        true -> lager:debug("PEAPv~p ServerHandshake found. Tx backlog", [PeapVer])
+      end,
       handle({eradius_send_cyphertext, NewQueue},
              State#{peap := MethodData#{tls_state := server_handshake_done
                                         ,tls_queue := <<>>}});

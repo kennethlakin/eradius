@@ -20,19 +20,13 @@ Getting started:
   as well as rustyio's sync auto-recompiler.
 
 Dependencies:
-* Erlang 18 or later
+* Erlang 19 or later (See "Version Notes" to run on Erlang 18)
 * lager
 * lager_syslog
 * sync
 rebar3 handles dependency fetching and compilation.
 
 Known issues:
-* The project contains a patched copy of the ssl application from
-  OTP 18.3. Patches applied are the "Use negotiated PRF for ssl:prf"
-  patch that has landed in OTP 19 and the "Add three-way toggle for
-  BEAST mitigation strategy" patch that is currently under consideration.
-  The patches are in patches/ if you wish to apply them to a different
-  version of the ssl application.
 * Loglevels are somewhat inappropriate.
 * Too little validation is done on incoming data.
 * Listen port is hard-coded.
@@ -44,6 +38,15 @@ Known issues:
   packets will not be handled correctly. The PEAP handling code needs to
   check for this condition and accumulate the complete TLS packet before
   sending it off to the TLS handler.
+
+Version Notes:
+OTP 19 contains the two patches required to make EAP-TLS function correctly.
+If you need to run on an earlier version of OTP, the patches directory contains
+patches that can be applied to OTP 18's ssl application. The directory also
+contains a tarball that is the OTP 18.3 ssl application with these patches applied.
+To use the patched ssl application, unpack the tarball in the apps directory, then
+see commit 4773cb5 for the Makefile changes required to load the patched ssl
+application in preference to the OTP ssl application.
 
 License:
 All code in the project is released under the terms of the GPLv2 or later,

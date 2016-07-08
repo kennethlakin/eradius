@@ -1,3 +1,5 @@
 Because beast-mitigation-selection-method.patch and tls-use-negotated-prf.patch
 have been submitted for inclusion in OTP, they are both released under the terms
 of the Apache License 2.0.
+ssl-18.3-patched.tar.bz2 contains the ssl application from OTP 18.3 with the above
+patches applied. It is also released under the APL 2.0.
