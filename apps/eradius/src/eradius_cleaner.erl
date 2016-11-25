@@ -1,4 +1,4 @@
--module(cache_cleaner).
+-module(eradius_cleaner).
 
 -include_lib("stdlib/include/ms_transform.hrl").
 
@@ -6,7 +6,7 @@
 -export([getName/0]).
 
 getName() ->
-  eradius_cache_cleaner.
+  eradius_cleaner.
 
 loop(Timeout) ->
   timer:sleep(Timeout),
@@ -27,4 +27,5 @@ cleanTables() ->
 
   ets:select_delete(radius_server:txTableTimeName(), TimeSelect),
   ets:select_delete(radius_server:txTableName(), TxSelect),
+
   ok.

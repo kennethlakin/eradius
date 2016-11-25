@@ -1,6 +1,13 @@
 -module(radius_sock).
 
--compile(export_all).
+-behavior(gen_server).
+
+%gen_server stuff:
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
+%External API
+-export([get_sock/0, take_ownership/1, release_ownership/1]).
+%Housekeeping
+-export([start_link/0, getName/0]).
 
 -compile([{parse_transform, lager_transform}]).
 
@@ -39,6 +46,6 @@ handle_call(_, _, State) ->
   {reply, error, State}.
 
 terminate(_,_) -> ok.
-handle_cast(_, _, State) -> {noreply, State}.
+handle_cast(_, State) -> {noreply, State}.
 handle_info(_, State) -> {noreply, State}.
 code_change(_, S, _) -> {ok, S}.

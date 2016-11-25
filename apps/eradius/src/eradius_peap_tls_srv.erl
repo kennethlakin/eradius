@@ -1,11 +1,14 @@
 -module(eradius_peap_tls_srv).
 
--compile(export_all).
-
 -behavior(gen_server).
-
-start(ParentPid) ->
-  radius_worker:start(?MODULE, ParentPid).
+%gen_server stuff:
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
+%radius_worker "behavior" stuff:
+-export([start_worker/1]).
+%External API
+-export([start_tls/4, handlePacket/3, peercert/1, run_prf/5, send/2]).
+%Used by tls_udp
+-export([sendCyphertext/2, tlsSocketReady/2]).
 
 start_worker(Args) ->
   gen_server:start_link(?MODULE, Args, []).
@@ -21,7 +24,10 @@ start_tls(SrvPid, PeerIp, RadState, FirstPacket) ->
   gen_server:call(SrvPid, {eradius_start_tls, PeerIp, RadState, FirstPacket}, infinity).
 
 run_prf(SrvPid, Secret, Label, Seed, Len) ->
-  gen_server:call(SrvPid, {eradius_run_prf, Secret, Label, Seed, Len}).
+  gen_server:call(SrvPid, {eradius_run_prf, Secret, Label, Seed, Len}, infinity).
+
+peercert(SrvPid) ->
+  gen_server:call(SrvPid, eradius_peercert, infinity).
 
 % RADIUS ----> SSL --> RADIUS (makes use of ssl:send)
 send(SrvPid, Data) ->
@@ -44,6 +50,10 @@ handle_call({eradius_run_prf, Secret, Label, Seed, Len}, _, State=#{socket := So
   when Socket /= undefined ->
   Ret=ssl:prf(Socket, Secret, Label, Seed, Len),
   {reply, Ret, State};
+handle_call(eradius_peercert, _, State=#{socket := Socket})
+  when Socket /= undefined ->
+  Ret=ssl:peercert(Socket),
+  {reply, Ret, State};
 %Start a new TLS connection.
 handle_call({eradius_start_tls, PeerIp, RadState, FirstPacket}, _,
             State=#{socket := undefined, rad_state := undefined}) ->
@@ -58,7 +68,7 @@ handle_call({eradius_send_plaintext, Data}, _, State=#{socket := Socket}) ->
 %Notify the EAP FSM that the TLS socket is up.
 handle_cast({eradius_tls_socket, Socket}, State=#{socket := undefined, fsm_pid := FSMPid,
                                                             rad_state := RadState}) ->
-  eap:tls_up(FSMPid, {tls_up, RadState}),
+  eradius_eap:tls_up(FSMPid, {tls_up, RadState}),
   {noreply, State#{socket := Socket, helper_pid := undefined}};
 %Feed cyphertext to the SSL machinery
 handle_cast({eradius_handle_packet, PeerIp, Data}, State) ->
@@ -66,19 +76,19 @@ handle_cast({eradius_handle_packet, PeerIp, Data}, State) ->
   {noreply, State};
 %Used for the SSL machinery to make the EAP machinery send bits on the wire.
 handle_cast(Msg={eradius_send_cyphertext, _}, State=#{fsm_pid := Pid}) ->
-  eap:send_cyphertext(Pid, Msg),
+  eradius_eap:send_cyphertext(Pid, Msg),
   {noreply, State}.
 
 %FIXME: Handle {ssl_closed, SslSocket}
 %       Handle {ssl_error, SslSocket, Reason}
 handle_info(Msg={ssl, Socket, _}, State=#{socket := Socket, fsm_pid := FSMPid}) ->
-  eap:handle_tls_data(FSMPid, Msg),
+  eradius_eap:handle_tls_data(FSMPid, Msg),
   {noreply, State};
 handle_info(Msg={tls_udp_server_start_error, _}, State=#{fsm_pid := FSMPid}) ->
-  eap:tls_server_start_error(FSMPid, Msg),
+  eradius_eap:tls_server_start_error(FSMPid, Msg),
   {noreply, State};
 handle_info({'EXIT', Pid, Reason}, State=#{fsm_pid := Pid}) ->
   {stop, Reason, State}.
 
 terminate(_, _) -> ok.
-code_change(_, _, _) -> ok.
+code_change(_, State, _) -> {ok, State}.

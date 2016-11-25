@@ -2,20 +2,45 @@
 
 -behavior(gen_server).
 
-%Public interface:
--export([lookup_nas/1, lookup_user/1, reload/0]).
+-type nas_lookup_ret() :: {ok, NasSecret :: term()} | {error, not_found}.
+-type user_lookup_ret() ::
+  {ok, Credential :: term(), SuccessAttrs :: map()}
+  | {ok, Credentials :: list(), SuccessAttrs :: map()}
+  | {error, not_found}.
 
--export([getName/0, start_link/0, init/1, handle_call/3
-         ,handle_cast/2, handle_info/2, terminate/2
-         ,code_change/3]).
+-callback lookup_nas(Nas :: term())                  -> nas_lookup_ret().
+-callback lookup_nas(Nas :: term(), Attrs :: map())  -> nas_lookup_ret().
+-callback lookup_user(User:: term())                 -> user_lookup_ret().
+-callback lookup_user(User:: term(), Attrs :: map()) -> user_lookup_ret().
+
+%It is expected that clients will call some variant of start_link unless there
+%is no state to be maintained, in which case 'ignore' is returned.
+-callback start_module() -> {ok, Pid :: pid()} | {ok, Pid :: pid(), Info :: term()}
+                            | {error, Err :: term()} | ignore.
+-callback reload() -> ok | {error, Err :: term()}.
+-callback getName() -> term().
+
+%Public interface:
+-export([lookup_nas/1, lookup_nas/2, lookup_user/1, lookup_user/2, start_module/0, reload/0]).
+%Housekeeping interface:
+-export([getName/0, start_link/0]).
+%gen_server stuff:
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -compile([{parse_transform, lager_transform}]).
 
 lookup_nas(Nas) ->
-  gen_server:call(getName(), {lookup, nas, Nas}).
+  lookup_nas(Nas, #{}).
+lookup_nas(Nas, Attrs) ->
+  gen_server:call(getName(), {lookup, nas, Nas, Attrs}).
 
 lookup_user(User) ->
-  gen_server:call(getName(), {lookup, user, User}).
+  lookup_user(User, #{}).
+lookup_user(User, Attrs) ->
+  gen_server:call(getName(), {lookup, user, User, Attrs}).
+
+%This isn't actually an auth module, so...
+start_module() -> {error, not_an_auth_module}.
 
 reload() ->
   gen_server:call(getName(), reload).
@@ -27,75 +52,63 @@ start_link() ->
   gen_server:start_link({local, getName()}, ?MODULE, [], []).
 
 init([]) ->
-  case loadCredentials() of
-    {ok, State} ->
-      {ok, State};
-    Err ->
-      {stop, {credential_file_load_fail, Err}}
+  {ok, App}=application:get_application(),
+  NasMods=application:get_env(App, nas_lookup_mods, []),
+  UserMods=application:get_env(App, user_lookup_mods, []),
+  N=lists:usort(NasMods),
+  U=lists:usort(UserMods),
+  MergedMods=lists:umerge(N, U),
+
+  self() ! start_children,
+  {ok, #{nas_mods => NasMods, user_mods => UserMods, merged_mods => MergedMods}}.
+
+handle_info(start_children, State=#{merged_mods := Mods}) ->
+  lists:foreach(fun(M) ->
+                    case eradius_auth_sup:start_auth_mod(M) of
+                      {error, Err} ->
+                        lager:warning("ERADIUS_AUTH Error starting mod ~p: '~p'", [M, {error, Err}]);
+                      _ -> ok
+                    end
+                end, Mods),
+  {noreply, State};
+handle_info(_,State) -> {noreply, State}.
+
+handle_call({lookup, nas, Key, Attrs}, _, State=#{nas_mods := NasMods}) ->
+  LookupResult=doNasLookup(Key, Attrs, NasMods),
+  {reply, LookupResult, State};
+handle_call({lookup, user, Key, Attrs}, _, State=#{user_mods := UserMods}) ->
+  LookupResult=doUserLookup(Key, Attrs, UserMods),
+  {reply, LookupResult, State};
+
+%%FIXME: Find a better way to signal when a module's reload fails.
+handle_call(reload, _, State=#{merged_mods := Mods}) ->
+  lists:foreach(
+    fun(Mod) ->
+        case Mod:reload() of
+          ok -> ok;
+          R -> lager:warning("ERADIUS_AUTH Module ~p returned '~p' during reload", [Mod, R])
+        end
+    end, Mods),
+  {reply, ok, State}.
+
+doNasLookup(_, _, []) ->
+  {error, not_found};
+doNasLookup(Key, Attrs, [Mod|Rest]) ->
+  case Mod:lookup_nas(Key, Attrs) of
+    {error, not_found} -> doNasLookup(Key, Attrs, Rest);
+    Ret -> Ret
   end.
 
-handle_call({lookup, Type, Key}, _, State) ->
-  case Type of
-    nas ->
-      #{nas := List} = State;
-    user ->
-      #{user := List} = State
-  end,
-  case lists:keyfind(Key, 1, List) of
-    false ->
-      {reply, {error, not_found}, State};
-    {Key, Credential} ->
-      {reply, {ok, Credential}, State}
-  end;
-
-handle_call(reload, _, State) ->
-  try
-    case loadCredentials() of
-      {ok, NewState} ->
-        {reply, ok, NewState};
-      Err ->
-        {reply, Err, State}
-    end
-  catch
-    E -> 
-      lager:error("ERADIUS_AUTH Critical error while reloading credentials ~p", [E]),
-      {reply, {error, E}, State};
-    X:Y -> 
-      lager:error("ERADIUS_AUTH Critical error while reloading credentials ~p:~p", [X,Y]),
-      {reply, {error, {X,Y}}, State}
+doUserLookup(_, _, []) ->
+  {error, not_found};
+doUserLookup(Key, Attrs, [Mod|Rest]) ->
+  case Mod:lookup_user(Key, Attrs) of
+    {error, not_found} -> doUserLookup(Key, Attrs, Rest);
+    Ret -> Ret
   end.
 
-loadCredentials() ->
-  %FIXME: Make this configurable and such.
-  FileName="credentials",
-  lager:info("ERADIUS_AUTH Attempting load of file ~p", [FileName]),
-  case file:consult(FileName) of
-    {ok, Result} ->
-      case lists:keyfind(user, 1, Result) of
-        {user, UserList} ->
-          case lists:keyfind(nas, 1, Result) of
-            {nas, NasList} ->
-              ConvU=lists:map(fun convertUser/1, UserList),
-              ConvN=lists:map(fun convertNas/1, NasList),
-              {ok, #{user => ConvU, nas => ConvN}};
-            false ->
-              {error, nas_list_not_present}
-          end;
-        false ->
-          {error, user_list_not_present}
-      end;
-    {error, E} ->
-      {error, file:format_error(E)}
-  end.
-
-convertUser({U, P}) ->
-  {erlang:iolist_to_binary(U), erlang:iolist_to_binary(P)}.
-
-convertNas({N, S}) ->
-  {ok, A}=inet:parse_address(N),
-  {A, erlang:iolist_to_binary(S)}.
 
 handle_cast(_, State) -> {noreply, State}.
 terminate(_,_) -> ok.
-handle_info(_,_) -> ok.
 code_change(_,State,_) -> {ok, State}.
+

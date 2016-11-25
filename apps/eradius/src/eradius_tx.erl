@@ -1,6 +1,13 @@
--module(radius_tx).
+-module(eradius_tx).
 
--compile(export_all).
+-behavior(gen_server).
+
+%gen_server stuff:
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
+%External API
+-export([findCachedEntry/3, send/4, resend/3]).
+%Housekeeping
+-export([start_link/0, getName/0]).
 
 send(Addr, Port, Data, TriggeringData) ->
   Key={Addr, TriggeringData},
@@ -28,17 +35,15 @@ init(_) ->
   UdpSock=radius_sock:get_sock(),
   {ok, #{udp_sock => UdpSock}}.
 
-handle_call(_, _, State) ->
-  {noreply, State}.
+handle_call(_, _, State) -> {noreply, State}.
 handle_cast({send, Addr, Port, Data}, S=#{udp_sock := Sock}) ->
   ok=gen_udp:send(Sock, Addr, Port, Data),
   {noreply, S};
-handle_cast(_, State) ->
-  {noreply, State}.
-handle_info(_, State) ->
-  {noreply, State}.
+handle_cast(_, State) -> {noreply, State}.
+handle_info(_, State) -> {noreply, State}.
 
 terminate(_, _) -> ok.
+code_change(_, S, _) -> {ok, S}.
 
 getName() ->
-  eradius_radius_tx.
+  eradius_tx.

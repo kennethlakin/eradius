@@ -1,12 +1,14 @@
 This is an alpha quality RADIUS/EAP server.
 
 It currently supports EAP-MD5, EAP-MSCHAPv2, and PEAPv0/1-MSCHAPv2.
+It can also process FreeRADIUS dictionary files. (See eradius_process_fr_dict.erl
+for caveats and usage.)
 
 It shares no code with and is related only in function to the travelping/jungerl
 project of the same name.
 
-It has been tested with eapol_test, OS X 10.10.5, Windows 7, and a couple of
-Android devices.
+It has been tested with wpa_supplicant, eapol_test, OS X 10.10.5, Windows 7, and
+several Android devices.
 
 Getting started:
 * Install rebar3 and put it on your PATH.
@@ -20,24 +22,34 @@ Getting started:
   as well as rustyio's sync auto-recompiler.
 
 Dependencies:
-* Erlang 19 or later (See "Version Notes" to run on Erlang 18)
+* Erlang 19 or later (See "Version Notes" to run on Erlang 18, as well as
+  important information for use of TLS client certificates and Windows clients.)
 * lager
 * lager_syslog
 * sync
 rebar3 handles dependency fetching and compilation.
 
 Known issues:
-* Loglevels are somewhat inappropriate.
+* The FreeRADIUS dictionary processor ignores include directives.
+  All dictionaries must be combined into a single file for processing.
+* WiMAX TLVs that need the WiMAX continuation bit to be set are not
+  correctly handled.
+* Encoder data size checking doesn't take into account container depth. It's
+  currently up to the caller to keep track of container depth and not attempt
+  to encode too much data.
+* Ascend-Send-Secret encrypt/decrypt is unsupported.
+* Extended, Long Extended, and Extended Vendor-Specific attributes
+  are unsupported.
+* "Ascend binary filter" attributes are unsupported.
+* Encode of WiMAX Combo IP attributes is unsupported.
+* Loglevels are somewhat inappropriate, and the "info" log level is useless to
+  a server operator.
 * Too little validation is done on incoming data.
 * Listen port is hard-coded.
 * RADIUS packet handler crashes rather than sending an Access-Reject if sent
   a non-EAP packet.
 * Very little validation is performed on PEAP packets. No validation is
   performed on TLS payloads in PEAP packets.
-* TLS messages transmited by the NAS that are split across multiple RADIUS
-  packets will not be handled correctly. The PEAP handling code needs to
-  check for this condition and accumulate the complete TLS packet before
-  sending it off to the TLS handler.
 
 Version Notes:
 OTP 19 contains the two patches required to make EAP-TLS function correctly.
@@ -48,8 +60,16 @@ To use the patched ssl application, unpack the tarball in the apps directory, th
 see commit 4773cb5 for the Makefile changes required to load the patched ssl
 application in preference to the OTP ssl application.
 
+OTP 19.1.1 or later (or -I think- an OTP release prior to 19) is required if you
+want to ask for TLS client certificates and might interact with a Windows client.
+OTP 19 introduced a regression in TLS record decoding that was resolved in 19.1.1.
+
 License:
-All code in the project is released under the terms of the GPLv2 or later,
-with the exception of the bundled OTP ssl application. That code (and the
-patches applied to it) is released under the terms of the Apache License
-2.0.
+All code in the project is released under the terms of the GPLv2 or later, with the
+exception of the contents of the patches directory and dicts/dict.
+As mentioned above, the patches directory contains patches to OTP 18 (as well as a
+pre-patched version of OTP 18.3's ssl application) that are released under the terms
+of the Apache License 2.0.
+dicts/dict is a combination of dictionaries from FreeRADIUS 3.0.11. Given that
+FreeRADIUS is licensed under the GPLv2 (but not later), I presume that its
+dictionaries are also made available under terms of the GPLv2.

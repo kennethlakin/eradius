@@ -1,7 +1,13 @@
 -module(eradius_peap_tls_start).
 
--compile(export_all).
 -compile([{parse_transform, lager_transform}]).
+
+%FIXME: Change this from camelCase to underscore_format.
+-export([startTlsConnectionHelper/4]).
+%radius_worker "behavior" stuff:
+-export([start_worker/1]).
+%Internal
+-export([createNewServer/4]).
 
 startTlsConnectionHelper(TlsSinkPid, PeerIp, RadState, FirstPacket) ->
   radius_worker:start(?MODULE, [TlsSinkPid, PeerIp, RadState, FirstPacket]).

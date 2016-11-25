@@ -1,35 +1,37 @@
 -module(eradius_mschap).
 -compile([{parse_transform, lager_transform}]).
+%Don't warn about the unused self-test code:
+-compile([{nowarn_unused_function, run_test/0}, {nowarn_unused_function, checkAuthenticatorResponse/6}]).
+
+-include_lib("eradius/include/common.hrl").
 
 -export([handle/2]).
--export([generateNtResponse/4, generateAuthenticatorResponse/5]).
+-define(E_AUTH_FAILURE, 691).
+-define(E_ACCT_DISABLED, 647).
 
--export([run_test/0]).
-
-handle({handle, {_, Id, _, _, _},
-    {_, _, _, _, _, _}},
+handle({handle, #eradius_eap{id=Id}, #eradius_rad{}},
     State=#{mschapv2 := MethodData=#{state := undefined}}) ->
   MSCHAPv2Bytes=crypto:strong_rand_bytes(16),
   %It is not at all required to put a name in the challenge packet.
   Name= <<"erlang.eap.server">>,
   NewState=State#{mschapv2 := MethodData#{state := {challenge_sent, MSCHAPv2Bytes, Name}}},
-  NextId=eap:incrementId(Id),
+  NextId=eradius_eap:incrementId(Id),
   BytesLen=byte_size(MSCHAPv2Bytes),
   Data=create_packet(challenge, NextId, <<BytesLen, MSCHAPv2Bytes/binary, Name/binary>>),
   lager:info("MSCHAP Tx challenge packet"),
   lager:debug("MSCHAP Id ~p Challenge ~p Name ~p Len ~p",
               [NextId, radius_server:bin_to_hex(MSCHAPv2Bytes), Name, BytesLen]),
   {enqueue_and_send, {access_challenge, request, Data}, NewState};
-handle({handle, {_, Id, _, _Type, TypeData},
-    {_, _, _, _, _, _}},
-    State=#{mschapv2 := MethodData=#{state := {challenge_sent, AuthChallenge, _Name}}}) ->
+handle({handle, #eradius_eap{id=Id, typedata=TypeData}, #eradius_rad{}},
+    State=#{rad_attrs := RadAttrs,
+      mschapv2 := MethodData=#{state := {challenge_sent, AuthChallenge, _Name}}}) ->
   %Reserved and Flags both must be zero-filled. (RFC2759)
   Reserved=binary:copy(<<0>>, 8),
   Flags=0,
   case TypeData of
     %Response packet.
     %FIXME: Use ChapLen and ValueSize to verify the packet!
-    <<2, Id:1/bytes, _ChapLen:2/bytes, _ValueSize:1/bytes,
+    <<2, Id, _ChapLen:2/bytes, _ValueSize:1/bytes,
       PeerChallenge:16/bytes, Reserved:8/bytes, NtResponse:24/bytes, Flags,
       ChapUserName/binary>> ->
       lager:info("MSCHAP Rx challenge response"),
@@ -45,60 +47,57 @@ handle({handle, {_, Id, _, _Type, TypeData},
       end,
       %FIXME: Add a retry counter that eventually sends a non-retryable
       %       failure.
-      case eradius_auth:lookup_user(UserName) of
+      %FIXME: lookup_user should return success_attrs and _also_
+      %       failure_attrs that are sent along with the RADIUS Accept/Reject.
+      case eradius_auth:lookup_user(UserName, RadAttrs) of
         {error, not_found} ->
           lager:notice("MSCHAP Username not found."),
-          lager:debug("MSCHAP Username ~p ~p", [ChapUserName, UserName]),
+          lager:debug("MSCHAP Username Raw ~p Processed ~p", [ChapUserName, UserName]),
           lager:info("MSCHAP Tx failure packet"),
           %FIXME: It's not entirely clear what the best approach is here. OS X
           %       has the only GUI that consistently does something reasonable
           %       when auth fails. For now, we send a retryable 647
           %       (ERROR_ACCT_DISABLED)
-          FP=create_packet(failure, Id, 647, true, AuthChallenge, <<>>),
+          FP=create_packet(failure, Id, ?E_ACCT_DISABLED, true, AuthChallenge, <<>>),
           {enqueue_and_send, {access_challenge, request, FP}, State};
-        {ok, Password} ->
-          %Convert password from UTF8 to UTF16-LE:
-          ConvertedPass=unicode:characters_to_binary(Password,
-                                                     utf8, {utf16, little}),
-          CalculatedReponse=eradius_mschap:generateNtResponse(AuthChallenge, PeerChallenge,
-                                                              UserName, ConvertedPass),
-          case CalculatedReponse == NtResponse of
-            true ->
+        {ok, Passwords, SuccessAttrs} ->
+          case validateAuth(Passwords, AuthChallenge, PeerChallenge, UserName, NtResponse) of
+            {valid, ConvertedPass} ->
               lager:info("MSCHAP Challenge response valid"),
-              AuthResp=eradius_mschap:generateAuthenticatorResponse(ConvertedPass, NtResponse, PeerChallenge,
+              AuthResp=generateAuthenticatorResponse(ConvertedPass, NtResponse, PeerChallenge,
                                                                     AuthChallenge, UserName),
               Message= <<>>,
               Data=create_packet(success, Id, AuthResp, Message),
-              NewState=State#{mschapv2 := MethodData#{state => mschap_success_sent}},
+              NewState=State#{mschapv2 := MethodData#{state => mschap_success_sent, success_attrs := SuccessAttrs}},
               lager:info("MSCHAP Tx MSCHAP success"),
               lager:debug("MSCHAP Id ~w AuthResponse ~p Message ~p Packet ~p",
                           [Id, radius_server:bin_to_hex(AuthResp)
                            ,radius_server:bin_to_hex(Message), radius_server:bin_to_hex(Data)]),
               {enqueue_and_send, {access_challenge, request, Data}, NewState};
-            false ->
+            invalid ->
               lager:notice("MSCHAP Challenge response invalid"),
-              lager:debug("MSCHAP Peer NtResponse ~p Correct NtResponse ~p",
-                          [radius_server:bin_to_hex(NtResponse)
-                           ,radius_server:bin_to_hex(CalculatedReponse)]),
               lager:info("MSCHAP Tx auth retry packet"),
               %If the username is valid, but the password is not, send a
               %retryable 691 (ERROR_AUTHENTICATION_FAILURE)
-              FailPacket=create_packet(failure, Id, 691, true, AuthChallenge, <<>>),
+              FailPacket=create_packet(failure, Id, ?E_AUTH_FAILURE, true, AuthChallenge, <<>>),
               {enqueue_and_send, {access_challenge, request, FailPacket}, State}
           end
       end;
+    %Sometimes the peer will send us a failure packet while we're in the middle
+    %of the conversation.
+    <<4>> ->
+      lager:info("MSCHAP Rx failure packet. Aborting"),
+      {auth_fail, {access_reject, failure, <<>>}, State};
     _ ->
       lager:notice("MSCHAP Malformed packet"),
       lager:debug("MSCHAP Packet ~p", [radius_server:bin_to_hex(TypeData)]),
       {ignore, bad_packet, State}
   end;
-handle({handle, {_, _, _, _, <<3>>},
-    {_, _, _, _, _, _}},
-    State=#{mschapv2 := #{state := mschap_success_sent}}) ->
+handle({handle, #eradius_eap{typedata= <<3>>}, #eradius_rad{}},
+    State=#{mschapv2 := #{state := mschap_success_sent, success_attrs := SuccessAttrs}}) ->
   lager:info("MSCHAP Tx RADIUS success"),
-  {auth_ok, {access_accept, success, <<>>}, State};
-handle({handle, {_, _, _, _, <<4>>},
-    {_, _, _, _, _, _}},
+  {auth_ok, {access_accept, success, <<>>, SuccessAttrs}, State};
+handle({handle, #eradius_eap{typedata= <<4>>}, #eradius_rad{}},
     State=#{mschapv2 := #{state := mschap_failure_sent}}) ->
   lager:info("MSCHAP Tx RADIUS failure"),
   {auth_fail, {access_reject, failure, <<>>}, State}.
@@ -130,9 +129,31 @@ create_packet(Type, Id, Data) ->
       failure -> <<4>>
     end,
   MSLen=byte_size(Data)+4,
-  <<26, Code/binary, Id/binary, MSLen:16, Data/binary>>.
+  <<26, Code/binary, Id, MSLen:16, Data/binary>>.
 
 %Support functions:
+
+%If we have more than one password to check, then this means that the given
+%username can auth with more than one password. So, check all of the passwords
+%until we either find the one that the user authenticated with, or we discover
+%that the password used for authentication doesn't match any of the ones we
+%have on file.
+validateAuth(Password, AuthChallenge, PeerChallenge, UserName, NtResponse)
+  when is_binary(Password) ->
+  validateAuth([Password], AuthChallenge, PeerChallenge, UserName, NtResponse);
+validateAuth([], _, _, _, _) ->
+  invalid;
+validateAuth([Password|Rest], AuthChallenge, PeerChallenge, UserName, NtResponse) ->
+  %Convert password from UTF8 to UTF16-LE:
+  ConvertedPass=unicode:characters_to_binary(Password,
+                                             utf8, {utf16, little}),
+  CalculatedReponse=generateNtResponse(AuthChallenge, PeerChallenge,
+                                                      UserName, ConvertedPass),
+  case CalculatedReponse == NtResponse of
+    true -> {valid, ConvertedPass};
+    false -> validateAuth(Rest, AuthChallenge, PeerChallenge, UserName, NtResponse)
+  end.
+
 generateNtResponse(<<AuthChallenge:16/bytes>>, <<PeerChallenge:16/bytes>>,
                    UserName, Password) when
     byte_size(Password) =< 256*2 andalso byte_size(UserName) =< 256 ->

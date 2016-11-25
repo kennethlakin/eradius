@@ -1,8 +1,23 @@
 -module(tls_udp).
 
 -compile([{parse_transform, lager_transform}]).
--compile(export_all).
 -behavior(gen_server).
+
+%gen_server stuff:
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
+%Public API
+-export([start_link/0]).
+%radius_worker "behavior" stuff:
+-export([start_worker/1]).
+%Housekeeping API
+-export([getName/0]).
+%Internal API
+-export([createNewServer/3, startSslServer/4]).
+%inets mock API
+-export([getopts/2, setopts/2, controlling_process/2, listen/2, close/1
+         ,peername/1, port/1, send/2]).
+
+%%FIXME: connTableName/0 and getPid/1 are unused. Why?
 
 connTableName() ->
   tls_udp_conn_table.
@@ -145,7 +160,34 @@ startSslServer(Addr, Port, SslSinkPid, AddlOpts) ->
   %%This works, but it requires intercommunication between the setopts function
   %%and the SSL server initialization code. That's in there, and it works, but
   %%it's not pretty.
-  Opts=[{cb_info, {?MODULE, tls_udp, closed, error}}] ++ AddlOpts,
+  Opts=[{cb_info, {?MODULE, tls_udp, closed, error}}]
+        ++ AddlOpts
+        %NOTE: This only works reliably with 19.1.1 and later: 19.0 introduced
+        %      a regression in the handling of TLS records that combine
+        %      multiple messages in a single record. Windows supplicants do
+        %      exactly this, so handshaking failed with them.
+        ++[{verify, verify_peer}],
+  %NOTE: The default peer certificate validation function is the
+  %following:
+  %{fun(_,{bad_cert, _} = Reason, _) ->
+  %       {fail, Reason};
+  %     (_,{extension, _}, UserState) ->
+  %       {unknown, UserState};
+  %     (_, valid, UserState) ->
+  %       {valid, UserState};
+  %     (_, valid_peer, UserState) ->
+  %       {valid, UserState}
+  % end, []}
+  %
+  % Notice that this returns a validation error for certificates that are
+  % expired. We can probably modify the function by adding a clause like so:
+  %     (_,{bad_cert, cert_expired}, UserState) ->
+  %       {valid, UserState};
+  % if we want to also accept certs that have expired.
+  %
+  %FIXME: If the client presents us with a bad cert
+  %       (e.g. one issued by another CA) this will return
+  %       {error, {tls_alert, "bad certificate"}}
   {ok, SSock}=ssl:ssl_accept(FakeSock, Opts),
   unlink(SslSinkPid),
   %Setting binary mode immediately to avoid a race that
@@ -313,8 +355,8 @@ controlling_process(Sock, NewPid) ->
           ?MODULE:getName() ! {sslPid, Sock, NewPid},
           ok;
         Other ->
-          lager:warn("TLS_UDP controlling_process called by ~p but ~p is owner. returning not_owner",
-                     [Self, Other]),
+          lager:warning("TLS_UDP controlling_process called by ~p but ~p is owner. returning not_owner",
+                        [Self, Other]),
           {error, not_owner}
       end
   end.
@@ -349,4 +391,4 @@ send(Sock, Packet) ->
   end.
 %End inet:* socket functions required for fakesock
 
-code_change(_, _, _) -> ok.
+code_change(_, State, _) -> {ok, State}.

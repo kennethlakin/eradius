@@ -1,9 +1,22 @@
 -module(radius_server).
-
 -compile([{parse_transform, lager_transform}]).
--compile(export_all).
+
+-include_lib("eradius/include/common.hrl").
 
 -behavior(gen_server).
+
+%gen_server stuff:
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
+%Work table management API
+-export([getWorkEntry/2, insertWorkEntry/4, updateWorkEntry/4, deleteWorkEntry/2]).
+%Used by radius_worker:
+-export([getNewStateData/0, determineWhatToDo/1]).
+%Housekeeping:
+-export([start_link/0, getName/0]).
+%Work table management housekeeping API
+-export([txTableTimeName/0, txTableName/0, workTableTimeName/0, workTableName/0]).
+%Utility stuff that should maybe be elsewhere:
+-export([bin_to_hex/1]).
 
 getName() ->
   eradius_radius_server.
@@ -34,16 +47,18 @@ init(_) ->
   inet:setopts(UdpSock, [{active, false}]),
   inet:setopts(UdpSock, [{active, Schedulers}]),
   lager:info("RADIUS Initialized with ~p workers", [Schedulers]),
-  {ok, #{udp_sock => UdpSock, num_schedulers => Schedulers}}.
+  {ok, #{udp_sock => UdpSock, num_schedulers => Schedulers, monitor_list => #{}}}.
 
 %FIXME: Useful RFCS:
 %       2865 5080 (RADIUS and RADIUS implementation lessons.)
+%       2866 (RADIUS Accounting)
 %       3579 3748 (EAP and EAP-RADIUS)
 %       2433 (MSCHAPv1)
 %       2759 draft-kamath-pppext-eap-mschapv2-02 (MSCHAPv2)
 %             (NOTE: SHAInit/Update/Final are crypto:hash_init/update/final)
 %       1994 (for PPP-CHAP, which is required to understand EAP-MD5 as well as
 %             MSCHAP and MSCHAPv2)
+%       5216 (EAP-TLS)
 %       5281 (TTLSv0)
 %       7170 (TEAPv1) [Not gonna get to this any time soon. It uses TLS SessionTicket]
 %       draft-kamath-pppext-peapv0-00 (PEAPv0)
@@ -60,14 +75,9 @@ init(_) ->
 %               the requesting peer was previously authorized, so there's no
 %               need to redo all the auth/authz stuff again.
 
-handle_cast({done, ElapsedTime}, State=#{udp_sock := Sock}) ->
-  inet:setopts(Sock, [{active, 1}]),
-  lager:info("RADIUS Worker done. total time taken ~pus",
-             [erlang:convert_time_unit(ElapsedTime, native, micro_seconds)]),
-  {noreply, State}.
 
-handle_info({udp, Sock, Addr, Port, Data}, State=#{udp_sock := Sock}) ->
-  T1=erlang:monotonic_time(),
+handle_info({udp, Sock, Addr, Port, Data}, State=#{udp_sock := Sock, monitor_list := MonList}) ->
+  Now=erlang:monotonic_time(),
   case isWorkEntry(radius_worker, {Addr, Port, Data}) of
     true ->
       lager:info("RADIUS Worker already working on packet. Dropping."),
@@ -75,9 +85,35 @@ handle_info({udp, Sock, Addr, Port, Data}, State=#{udp_sock := Sock}) ->
       {noreply, State};
     false ->
       lager:info("RADIUS Starting worker"),
-      {ok, _}=radius_worker:start(radius_worker, {Addr, Port, Data, T1}),
-      {noreply, State}
+      {ok, Pid}=radius_worker:start(radius_worker, {Addr, Port, Data}),
+      case is_pid(Pid) of
+        false -> NewState=State;
+        true ->
+          MonRef=monitor(process, Pid),
+          NewML=MonList#{MonRef => {Pid, Now}},
+          NewState=State#{monitor_list := NewML}
+      end,
+      {noreply, NewState}
   end;
+handle_info({'DOWN', _, process, Pid, noproc}, State) ->
+  lager:debug("RADIUS Process ~w didn't exist when we tried to monitor it", [Pid]),
+  {noreply, State};
+handle_info({'DOWN', _, process, Pid, noconnection}, State) ->
+  lager:debug("RADIUS Connection to node with process ~w dropped", [Pid]),
+  {noreply, State};
+handle_info({'DOWN', MonRef, process, Pid, Reason}, State=#{monitor_list := MonList, udp_sock := Sock}) ->
+  Now=erlang:monotonic_time(),
+  case maps:get(MonRef, MonList, undefined) of
+    undefined ->
+      lager:debug("RADIUS Got monitor ~w for pid ~w that we have no record of.", [MonRef, Pid]),
+      NewState=State;
+    {Pid, Start} ->
+      inet:setopts(Sock, [{active, 1}]),
+      Elapsed=erlang:convert_time_unit(Now-Start, native, micro_seconds),
+      lager:debug("RADIUS Worker ~w exited with reason ~w. Total time taken ~wus", [Pid, Reason, Elapsed]),
+      NewState=State#{monitor_list := maps:remove(MonRef, MonList)}
+  end,
+  {noreply, NewState};
 %If all of our workers are busy, our socket falls into passive mode, and we get
 %this message. It can be safely ignored.
 handle_info({udp_passive, Sock}, State=#{udp_sock := Sock}) ->
@@ -142,17 +178,25 @@ deleteWorkEntry(Mod, Key) ->
   end.
 %End work table management.
 
-
-newStateAttr() ->
-  Data=getNewStateData(),
-  Len=byte_size(Data)+2,
-  <<24, Len/integer, Data/binary>>.
-
 %FIXME: Might we want to check to see if the State value that we cook up
 %       corresponds to any of the State values that we already know about, to
 %       ward against the case where our node fell over, but we have a NAS out
 %       there that was in the middle of a conversation with us?
 getNewStateData() ->
+  %About unique_integer and Erlang External Term Format:
+  %For numbers whose absolute value is larger than 2^31, one byte is used for sign
+  %storage. On 64-bit systems, we seem to start with eight-byte signed numbers.
+  %So, the size of State will be no larger than nine bytes for (best case)
+  %2^48 RADIUS conversations. When we hit that limit one byte will be added and
+  %we'll get (best case) 2^New-2^(New-1) more RADIUS conversations before we
+  %resize State.
+  %
+  %However, the documentation for unique_integer talks about there being
+  %NUM_SCHEDULERS+1 pools, each pool containing (2^64)-1 unique integers.
+  %So, while I can put a lower bound on the size of State, I can't really
+  %put a good upper bound on it.
+  %However, it seems likely that State will be no larger than nine bytes for
+  %a _very_ long time.
   Int=erlang:unique_integer(),
   Raw=erlang:term_to_binary(Int),
   trimErlangTags(Raw).
@@ -163,37 +207,13 @@ trimErlangTags(<<131, 98, Num/binary>>) -> Num;
 trimErlangTags(<<131, 110, _:1/bytes, Num/binary>>) -> Num;
 trimErlangTags(<<131, 111, _:4/bytes, Num/binary>>) -> Num.
 
-%Called to turn a EAP-TLS-derived Master Key into an MS-MPPE-*-Key payload.
-%From RFC 2548 sec 2.4.2
-scramble_mppe_key(<<Key:32/bytes>>, {Ip,_,RadAuth,_,_,_}) ->
-  {ok, NasSecret}=eradius_auth:lookup_nas(Ip),
-  <<_:1, BaseSalt:15>> =crypto:strong_rand_bytes(2),
-  Salt= <<1:1,BaseSalt:15>>,
-  Padding=binary:copy(<<0>>, 15),
-  <<Plain:48/bytes>> = <<32, Key/binary, Padding/binary>>,
-  <<Scrambled:48/bytes>> =startScramble(Plain, NasSecret, RadAuth, Salt),
-  <<Salt/binary, Scrambled/binary>>.
-
-startScramble(<<Plain:16/bytes, Rest/binary>>, Secret, RadAuth, Salt) ->
-  B=crypto:hash(md5, <<Secret/binary, RadAuth/binary, Salt/binary>>),
-  C=crypto:exor(Plain, B),
-  doScramble(Rest, Secret, C, C).
-doScramble(<<>>, _, _, Acc) -> Acc;
-doScramble(<<Plain:16/bytes, Rest/binary>>, Secret, PrevChunk, Acc) ->
-  B=crypto:hash(md5, <<Secret/binary, PrevChunk/binary>>),
-  C=crypto:exor(Plain, B),
-  doScramble(Rest, Secret, C, <<Acc/binary, C/binary>>).
-
 %FIXME: This belongs in a utility module.
 bin_to_hex(Bin) when is_binary(Bin) ->
   lists:flatten(
     [io_lib:format("~2.16.0B", [X]) || X <- binary_to_list(Bin)]).
 
-determineWhatToDo(#{eap_message := _}) -> eap;
+determineWhatToDo(#{eap_message := _}) -> eradius_eap;
 determineWhatToDo(#{}) -> unknown.
-
-signalDone(ElapsedTime) when is_integer(ElapsedTime) ->
-  gen_server:cast(getName(), {done, ElapsedTime}).
 
 createTables() ->
   %work_table is a set because its keys should never collide.
@@ -212,6 +232,7 @@ terminate(_, #{udp_sock := Sock}) ->
 terminate(_,_) -> ok.
 
 handle_call(_, _, State) -> {noreply, State}.
+handle_cast(_, State) -> {noreply, State}.
 
 code_change(_, State, _) -> {ok, State}.
 

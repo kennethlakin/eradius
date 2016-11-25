@@ -1,0 +1,19 @@
+#This is a test dictionary for as-of-yet-unwritten
+#VSA attribute encoder compression code. Most of the
+#attributes in here are fake.
+ATTRIBUTE Vendor-Specific       26  vsa
+
+VENDOR Microsoft 311
+BEGIN-VENDOR Microsoft
+
+ATTRIBUTE ms-fake-ten-tlv 10 tlv
+ATTRIBUTE ms-fake-eleven-tlv 11 tlv
+ATTRIBUTE ms-fake-eleven-eleven-tlv 11.11 tlv
+ATTRIBUTE ms-fake-nested-integer-ten-one 10.1 integer
+ATTRIBUTE ms-fake-nested-integer-ten-two 10.2 integer
+ATTRIBUTE ms-fake-nested-integer-eleven-one 11.11.1 integer
+ATTRIBUTE ms-fake-nested-integer-eleven-two 11.11.2 integer
+ATTRIBUTE ms-chap-response 1 octets[50]
+ATTRIBUTE ms-ras-vendor 9 integer
+
+END-VENDOR Microsoft
