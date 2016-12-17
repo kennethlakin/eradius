@@ -14,7 +14,7 @@
 %Housekeeping:
 -export([start_link/0, getName/0]).
 %Work table management housekeeping API
--export([txTableTimeName/0, txTableName/0, workTableTimeName/0, workTableName/0]).
+-export([txTableName/0, workTableName/0]).
 %Utility stuff that should maybe be elsewhere:
 -export([bin_to_hex/1]).
 
@@ -24,30 +24,29 @@ getName() ->
 workTableName() ->
   eradius_work_table.
 
-workTableTimeName() ->
-  eradius_work_table_time.
-
 txTableName() ->
   eradius_tx_table.
-
-txTableTimeName() ->
-  eradius_tx_table_time.
 
 start_link() ->
   gen_server:start_link({local, getName()}, ?MODULE, [], []).
 
 init(_) ->
-  Schedulers=erlang:system_info(schedulers),
+  Multiplier=2,
+  Workers=erlang:system_info(schedulers)*Multiplier,
   createTables(),
   UdpSock=radius_sock:get_sock(),
+  AccSock=radius_sock:get_accounting_sock(),
   ok=radius_sock:take_ownership(UdpSock),
+  ok=radius_sock:take_ownership(AccSock),
   %First switch to passive mode so that in case of starting back up after a
-  %crash we're sure that we have at most a queue of length Schedulers.
+  %crash we're sure that we have at most a queue of length Workers.
   %FIXME: Consider looking at the read_packets option.
   inet:setopts(UdpSock, [{active, false}]),
-  inet:setopts(UdpSock, [{active, Schedulers}]),
-  lager:info("RADIUS Initialized with ~p workers", [Schedulers]),
-  {ok, #{udp_sock => UdpSock, num_schedulers => Schedulers, monitor_list => #{}}}.
+  inet:setopts(AccSock, [{active, false}]),
+  inet:setopts(UdpSock, [{active, Workers}]),
+  inet:setopts(AccSock, [{active, Workers}]),
+  lager:info("RADIUS Initialized with ~p workers", [Workers]),
+  {ok, #{udp_sock => UdpSock, acc_sock => AccSock, num_schedulers => Workers, monitor_list => #{}}}.
 
 %FIXME: Useful RFCS:
 %       2865 5080 (RADIUS and RADIUS implementation lessons.)
@@ -76,63 +75,67 @@ init(_) ->
 %               need to redo all the auth/authz stuff again.
 
 
-handle_info({udp, Sock, Addr, Port, Data}, State=#{udp_sock := Sock, monitor_list := MonList}) ->
-  Now=erlang:monotonic_time(),
-  case isWorkEntry(radius_worker, {Addr, Port, Data}) of
-    true ->
-      lager:info("RADIUS Worker already working on packet. Dropping."),
-      inet:setopts(Sock, [{active, 1}]),
-      {noreply, State};
-    false ->
-      lager:info("RADIUS Starting worker"),
-      {ok, Pid}=radius_worker:start(radius_worker, {Addr, Port, Data}),
-      case is_pid(Pid) of
-        false -> NewState=State;
+handle_info({udp, Sock, Addr, Port, Data}, State=#{udp_sock := USock, acc_sock := ASock, monitor_list := MonList}) ->
+  case Sock of
+    Sock when Sock == USock orelse Sock == ASock ->
+      case isWorkEntry(radius_worker, {Addr, Port, Data}) of
         true ->
-          MonRef=monitor(process, Pid),
-          NewML=MonList#{MonRef => {Pid, Now}},
-          NewState=State#{monitor_list := NewML}
-      end,
-      {noreply, NewState}
+          lager:info("RADIUS Worker already working on packet. Dropping."),
+          inet:setopts(Sock, [{active, 1}]),
+          {noreply, State};
+        false ->
+          lager:info("RADIUS Starting worker"),
+          {ok, Pid}=radius_worker:start(radius_worker, {Addr, Port, Data, Sock}),
+          case is_pid(Pid) of
+            false -> NewState=State;
+            true ->
+              MonRef=monitor(process, Pid),
+              NewML=MonList#{MonRef => {Pid, Sock}},
+              NewState=State#{monitor_list := NewML}
+          end,
+          {noreply, NewState}
+      end;
+    _ ->
+      lager:info("RADIUS Packet from unknown socket. Ignoring."),
+      {noreply, State}
   end;
-handle_info({'DOWN', _, process, Pid, noproc}, State) ->
-  lager:debug("RADIUS Process ~w didn't exist when we tried to monitor it", [Pid]),
-  {noreply, State};
+
 handle_info({'DOWN', _, process, Pid, noconnection}, State) ->
+  %FIXME: Remove the monitored process from our list?
   lager:debug("RADIUS Connection to node with process ~w dropped", [Pid]),
   {noreply, State};
-handle_info({'DOWN', MonRef, process, Pid, Reason}, State=#{monitor_list := MonList, udp_sock := Sock}) ->
-  Now=erlang:monotonic_time(),
+handle_info({'DOWN', MonRef, process, Pid, Reason}, State=#{monitor_list := MonList}) ->
   case maps:get(MonRef, MonList, undefined) of
     undefined ->
-      lager:debug("RADIUS Got monitor ~w for pid ~w that we have no record of.", [MonRef, Pid]),
+      lager:debug("RADIUS Got DOWN ~w for pid ~w that we have no record of.", [MonRef, Pid]),
       NewState=State;
-    {Pid, Start} ->
+    {Pid, Sock} ->
       inet:setopts(Sock, [{active, 1}]),
-      Elapsed=erlang:convert_time_unit(Now-Start, native, micro_seconds),
-      lager:debug("RADIUS Worker ~w exited with reason ~w. Total time taken ~wus", [Pid, Reason, Elapsed]),
+      case Reason of
+        normal -> ok;
+        shutdown -> ok;
+        {shutdown, _} -> ok;
+        %The noproc "reason" is for workers that terminate before we get to
+        %monitor them.
+        noproc -> ok;
+        _ -> eradius_stats:worker_crashed(Pid)
+      end,
       NewState=State#{monitor_list := maps:remove(MonRef, MonList)}
   end,
   {noreply, NewState};
-%If all of our workers are busy, our socket falls into passive mode, and we get
-%this message. It can be safely ignored.
+%We can safely ignore this.
 handle_info({udp_passive, Sock}, State=#{udp_sock := Sock}) ->
-  lager:debug("RADIUS All workers busy"),
+  {noreply, State};
+handle_info({udp_passive, Sock}, State=#{acc_sock := Sock}) ->
   {noreply, State}.
 
-%Work table management:
 insertWorkEntry(Mod, Key, Status, Pid) ->
   Now=erlang:monotonic_time(),
   WK={Mod, Key},
   WV={Pid, Status, Now},
-  TK=Now,
-  TV=WK,
   case ets:insert_new(workTableName(), {WK, WV}) of
-    true ->
-      ets:insert(workTableTimeName(), {TK, TV}),
-      ok;
-    false ->
-      {error, duplicate_key}
+    true -> ok;
+    false -> {error, duplicate_key}
   end.
 
 getWorkEntry(Mod, Key) ->
@@ -152,26 +155,16 @@ updateWorkEntry(Mod, Key, Status, Pid) ->
   Now=erlang:monotonic_time(),
   WK={Mod, Key},
   WV={Pid, Status, Now},
-  TK=Now,
-  TV=WK,
-  %Get the TS so that we can remove the old time entry.
-  case ets:lookup(workTableName(), WK) of
-    [{_, {_, _, TS}}] ->
-      %Remove the old entry from the timestamp table.
-      ets:delete_object(workTableTimeName(), {TS, WK}),
-      ets:insert(workTableName(), {WK, WV}),
-      ets:insert(workTableTimeName(), {TK, TV}),
-      ok;
-    [] -> {error, work_entry_not_found};
-    [_|_] -> {error, many_entries_found}
+  case ets:update_element(workTableName(), WK, {2, WV}) of
+    true -> ok;
+    false -> {error, work_entry_not_found}
   end.
 
 deleteWorkEntry(Mod, Key) ->
   WK={Mod, Key},
   case ets:lookup(workTableName(), WK) of
-    [{_, {_, _, TS}}] ->
+    [{_, {_, _, _}}] ->
       ets:delete(workTableName(), WK),
-      ets:delete_object(workTableTimeName(), {TS, WK}),
       ok;
     [] -> {error, work_entry_not_found};
     [_|_] -> {error, many_entries_found}
@@ -218,14 +211,8 @@ determineWhatToDo(#{}) -> unknown.
 createTables() ->
   %work_table is a set because its keys should never collide.
   ets:new(workTableName(), [named_table, public, set]),
-  %work_table_time is a dup_bag because its keys might collide. It's dup_bag
-  %rather than bag so that we don't have the miniscule overhead of determining
-  %if an object to be inserted already exists for the key. Because we're
-  %storing work_table keys, we shouldn't have duplicate objects.
-  ets:new(workTableTimeName(), [named_table, public, duplicate_bag]),
   %FIXME: Determine what the tx_table key should be and its storage type.
-  ets:new(txTableName(), [named_table, public, duplicate_bag]),
-  ets:new(txTableTimeName(), [named_table, public, duplicate_bag]).
+  ets:new(txTableName(), [named_table, public, duplicate_bag]).
 
 terminate(_, #{udp_sock := Sock}) ->
   radius_sock:release_ownership(Sock);

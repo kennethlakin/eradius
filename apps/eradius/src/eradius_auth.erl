@@ -29,21 +29,25 @@
 
 -compile([{parse_transform, lager_transform}]).
 
+-define(mod_table, eradius_auth_modules).
+
 lookup_nas(Nas) ->
   lookup_nas(Nas, #{}).
 lookup_nas(Nas, Attrs) ->
-  gen_server:call(getName(), {lookup, nas, Nas, Attrs}).
+  [{_, NasMods}]=ets:lookup(?mod_table, nas_mods),
+  doNasLookup(Nas, Attrs, NasMods).
 
 lookup_user(User) ->
   lookup_user(User, #{}).
 lookup_user(User, Attrs) ->
-  gen_server:call(getName(), {lookup, user, User, Attrs}).
+  [{_, UserMods}]=ets:lookup(?mod_table, user_mods),
+  doUserLookup(User, Attrs, UserMods).
 
 %This isn't actually an auth module, so...
 start_module() -> {error, not_an_auth_module}.
 
 reload() ->
-  gen_server:call(getName(), reload).
+  gen_server:call(getName(), reload, infinity).
 
 getName() ->
   eradius_auth_srv.
@@ -58,13 +62,16 @@ init([]) ->
   N=lists:usort(NasMods),
   U=lists:usort(UserMods),
   MergedMods=lists:umerge(N, U),
+  ets:new(?mod_table, [named_table, {read_concurrency, true}]),
+  ets:insert(?mod_table, {nas_mods, NasMods}),
+  ets:insert(?mod_table, {user_mods, UserMods}),
 
   self() ! start_children,
-  {ok, #{nas_mods => NasMods, user_mods => UserMods, merged_mods => MergedMods}}.
+  {ok, #{merged_mods => MergedMods}}.
 
 handle_info(start_children, State=#{merged_mods := Mods}) ->
   lists:foreach(fun(M) ->
-                    case eradius_auth_sup:start_auth_mod(M) of
+                    case eradius_auth_sup:start_mod(M) of
                       {error, Err} ->
                         lager:warning("ERADIUS_AUTH Error starting mod ~p: '~p'", [M, {error, Err}]);
                       _ -> ok
@@ -72,13 +79,6 @@ handle_info(start_children, State=#{merged_mods := Mods}) ->
                 end, Mods),
   {noreply, State};
 handle_info(_,State) -> {noreply, State}.
-
-handle_call({lookup, nas, Key, Attrs}, _, State=#{nas_mods := NasMods}) ->
-  LookupResult=doNasLookup(Key, Attrs, NasMods),
-  {reply, LookupResult, State};
-handle_call({lookup, user, Key, Attrs}, _, State=#{user_mods := UserMods}) ->
-  LookupResult=doUserLookup(Key, Attrs, UserMods),
-  {reply, LookupResult, State};
 
 %%FIXME: Find a better way to signal when a module's reload fails.
 handle_call(reload, _, State=#{merged_mods := Mods}) ->

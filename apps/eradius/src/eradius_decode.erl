@@ -47,6 +47,19 @@ verifyPacket(NASSecret,
     true -> ok;
     false -> error
   end;
+%Accounting request:
+verifyPacket(NASSecret,
+             _, _,
+             <<Type:1/bytes, Identifier:1/bytes, Len:2/bytes, MsgAuth:16/bytes, AttrBin/binary>>)
+  when Type == <<4>> ->
+  CalculatedAuth=crypto:hash(md5, <<Type/binary, Identifier/binary, Len/binary,
+                                   0:(16*8), AttrBin/binary, NASSecret/binary>>),
+  lager:debug("DECODE MsgAuth  ~p", [MsgAuth]),
+  lager:debug("DECODE CalcAuth ~p", [CalculatedAuth]),
+  case CalculatedAuth == MsgAuth of
+    true -> ok;
+    false -> error
+  end;
 
 verifyPacket(NASSecret, Auth, Attrs=#{user_password := MsgVerifier
              ,user_name := UserName}, _) ->
@@ -89,7 +102,8 @@ encodeRadius(Addr, Type, Identifier, Auth, Attrs) ->
     access_reject -> Code= <<3>>;
     accounting_request -> Code= <<4>>;
     accounting_response -> Code= <<5>>;
-    access_challenge -> Code= <<11>>
+    access_challenge -> Code= <<11>>;
+    status_server -> Code= <<12>>
   end,
 
   AB=encodeAttributes(Attrs, Addr, Auth),
@@ -136,6 +150,7 @@ decodeRadius(P = <<_:1/bytes, _:1/bytes, L:2/bytes, _:16/bytes, _/binary>>) ->
           4 -> accounting_request;
           5 -> accounting_response;
           11 -> access_challenge;
+          12 -> status_server;
           _ -> unrecognized
         end,
       {ok, #eradius_rad_raw{code=Code, type=Type, id=Id, length=Len, auth=Auth, attrs=Attrs}}

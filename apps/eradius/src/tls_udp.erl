@@ -307,7 +307,8 @@ setopts(Sock, Opts) ->
       %If we're transitioning from passive to active mode, send a message.
       %but see the notes below about *why* we are doing this. It's odd.
       case proplists:get_value(active, Opts) of
-        Val when Val == true orelse Val == once ->
+        false -> ok;
+        _ ->
           %FIXME: Sending messages directly to the gen_server is really odd.
           %       We're doing this because the handle_info({udp...) is probably
           %       creating a server right now, and the ssl code switches the
@@ -320,8 +321,7 @@ setopts(Sock, Opts) ->
           %       messages RX'd during this time to the new PID.
           %       It might just be more robust to stand up a pair of UDP
           %       sockets and write the initial UDP packet into the socket.
-          ?MODULE:getName() ! {passiveToActiveTrans, Sock};
-        _ -> ok
+          ?MODULE:getName() ! {passiveToActiveTrans, Sock}
       end,
       NewOptMap=createNewOptMap(OptMap, Opts),
       ets:insert(fakeSockTabName(), {Sock, Map#{opts := NewOptMap}}),

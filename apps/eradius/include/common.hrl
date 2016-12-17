@@ -9,14 +9,13 @@
 -record(eradius_rad, {ip :: inet:ip_address(), port :: inet:port_number()
                       ,auth :: eradius_auth(), id :: eradius_id()
                       ,originalPacket :: binary(), state :: eradius_state()
-                      ,attrs :: eradius_attrs()}).
+                      ,attrs=#{} :: eradius_attrs()}).
 
 -type eradius_raw_code() :: pos_integer().
-%%FIXME: We might just want this type to be atom()... we might need to support
-%%       more RADIUS request types in the future.
+%%FIXME: We might just want this type to be atom()
 -type eradius_raw_requestType() :: 'access_request' | 'access_accept' |
         'access_reject' | 'accounting_request' | 'accounting_response' |
-        'access_challenge' | 'unrecognized'.
+        'access_challenge' | 'status_server' | 'unrecognized'.
 -type eradius_raw_length() :: pos_integer().
 -type eradius_raw_attrs() :: binary().
 
@@ -27,11 +26,7 @@
 
 -type eradius_eap_code() :: 'request' | 'response' | 'success' | 'failure'.
 -type eradius_eap_id() :: pos_integer().
-%FIXME: Would this be more useful as pos_integer()?
-%FIXME: Actually, it _should_ be pos_integer(), as the eap length is _two_
-%       bytes... but we're not sufficiently careful to always ensure that the
-%       value we synthesize (when required) is also two bytes.
--type eradius_eap_length() :: binary().
+-type eradius_eap_length() :: pos_integer().
 %%FIXME: This might need to change once we start handling expanded types.
 -type eradius_eap_auth_type() :: atom().
 -type eradius_eap_typedata() :: binary().
@@ -39,3 +34,8 @@
 -record(eradius_eap, {code :: eradius_eap_code(), id :: eradius_eap_id()
                      ,length :: eradius_eap_length(), type :: eradius_eap_auth_type()
                      ,typedata :: eradius_eap_typedata()}).
+
+-record(eradius_rad_handler_ret, {code :: eradius_raw_requestType(), attrs=#{} :: eradius_attrs()}).
+
+%Used by the eradius_cleaner to politely shutdown a stale worker
+-define(ERADIUS_CLEANER_EXIT, {shutdown, eradius_cleaner_reap}).

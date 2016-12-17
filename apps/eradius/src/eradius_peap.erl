@@ -6,10 +6,6 @@
 -include_lib("eradius/include/common.hrl").
 
 -compile([{parse_transform, lager_transform}]).
-%FIXME: Add an enrich_attributes (or whatever) function to EAP method handlers
-%       that will give the handler an opportunity to use state that it's aware
-%       of to add additional pseudo-attributes (such as tls_auth => okay) to
-%       the request for use by the authentication modules.
 -export([handle/2]).
 
 handle({handle, #eradius_eap{}, #eradius_rad{}},
@@ -87,12 +83,12 @@ handle({handle, #eradius_eap{typedata=TypeData}
         _ -> {send_queued, State}
       end
   end;
-handle({handle, #eradius_eap{id=Id}, #eradius_rad{}},
+handle({handle, #eradius_eap{}, #eradius_rad{}},
        State=#{peap := MethodData=#{state := tls_up
                                    ,peap_ver := PeapVer}}) ->
   lager:info("PEAPv~p Starting Phase 2", [PeapVer]),
   lager:debug("PEAPv~p Tx TLS identity request.", [PeapVer]),
-  ok=sendTlsIdentityRequest(Id, State),
+  ok=sendTlsIdentityRequest(State),
   {send_queued, State#{peap := MethodData#{state := inner_ident_sent}}};
 handle({handle, #eradius_eap{typedata=TypeData}
         ,#eradius_rad{ip=Ip}},
@@ -127,9 +123,10 @@ handle({handle, #eradius_eap{}, #eradius_rad{}},
   lager:info("PEAPv~p Inner auth success. Sending RADIUS accept", [PeapVer]),
   {auth_ok, {access_accept, success, <<>>, AddlAttrs}, State};
 handle({handle, #eradius_eap{}, #eradius_rad{}},
-       State=#{peap := #{state := inner_auth_failure, peap_ver := PeapVer}}) ->
+       State=#{peap := #{state := inner_auth_failure, peap_ver := PeapVer
+                        ,failure_attrs := FailureAttrs}}) ->
   lager:info("PEAPv~p Inner auth failure. Sending RADIUS reject", [PeapVer]),
-  {auth_fail, {access_reject, failure, <<>>}, State};
+  {auth_fail, {access_reject, failure, <<>>, FailureAttrs}, State};
 
 handle({tls_up, RadState}, State=#{current_method := peap
                                         ,last_rad := #eradius_rad{state=RS}
@@ -161,7 +158,7 @@ handle({tls_up, RadState}, State=#{current_method := peap
   #{tx_queue := TxQueue, tx_credits := TxCredits, peap := #{tls_queue := TlsQueue}} = State,
   case TxCredits == 1 andalso TlsQueue == <<>> andalso queue:is_empty(TxQueue) of
     true ->
-      lager:info("PEAPv~p Rehandling last EAP packet", [PeapVer]),
+      lager:debug("PEAPv~p Rehandling last EAP packet", [PeapVer]),
       gen_fsm:send_event(self(), rehandle_last_eap_packet);
     false -> ok
   end,
@@ -186,11 +183,13 @@ handle({eradius_send_cyphertext, D}, State=#{current_method := peap
         false -> ok;
         true -> lager:debug("PEAPv~p ServerHelloDone found. Tx backlog", [PeapVer])
       end,
-      {Ret, NS}=handle({eradius_send_cyphertext, NewQueue},
-                       State#{peap := MethodData#{tls_state := server_hello_sending
-                                                  ,tls_queue := <<>>}}),
+      case handle({eradius_send_cyphertext, NewQueue},
+                  State#{peap := MethodData#{tls_state := server_hello_sending
+                                             ,tls_queue := <<>>}}) of
+        {ok, Payload=#eradius_rad_handler_ret{}, NS} -> ok
+      end,
       #{peap := MD2}=NS,
-      {Ret, NS#{peap := MD2#{tls_state := server_hello_done}}};
+      {ok, Payload, NS#{peap := MD2#{tls_state := server_hello_done}}};
     _ ->
       lager:debug("PEAPv~p Enqueuing handshake type ~w", [PeapVer, MsgType]),
       {ok, State#{peap := MethodData#{tls_queue := NewQueue}}}
@@ -231,17 +230,18 @@ handle({eradius_send_cyphertext, D}, State=#{current_method := peap
   lager:debug("PEAPv~p Enqueued ~p bytes of cyphertext. Packet split into ~p parts. Work queue len: ~p Credits: ~p",
              [PeapVer, byte_size(Data), length(PktList), queue:len(Q), Credits]),
   case eradius_eap:transmitIfPossible(NewState) of
-    {ok, no_credits, SN} -> SN;
-    {ok, SN} -> SN
+    {ok, Payload=#eradius_rad_handler_ret{}, SN} -> SN
   end,
-  {ok, SN};
+  {ok, Payload, SN};
 
 handle({ssl, SslSocket, SData}, State=#{current_method := peap
                                                ,tls_srv_pid := SrvPid
-                                               ,last_rad := LastRad
-                                               ,last_eap := LastEap=#eradius_eap{id=Id}
+                                               ,last_rad := LastRad=#eradius_rad{attrs=RadAttrs}
+                                               ,last_eap := LastEap=#eradius_eap{}
                                                ,peap := MethodState=
-                                               #{peap_ver := PeapVer}})
+                                               #{peap_ver := PeapVer, state := PeapState
+                                                ,success_attrs := SuccessAttrs
+                                                ,failure_attrs := FailureAttrs}})
   when is_pid(SrvPid) ->
   case is_list(SData) of
     true ->
@@ -252,42 +252,35 @@ handle({ssl, SslSocket, SData}, State=#{current_method := peap
       SslData=SData
   end,
   lager:info("PEAPv~p Handling ~p bytes tunneled plaintext", [PeapVer, byte_size(SslData)]),
-  %FIXME: we really need to track the EAP IDs for the
-  %inner and outer conversations separately.
-  {ok, DecodedMessage=#eradius_eap{id=Id}}=decodeTunneledMessage(SslData, LastEap, State),
-  lager:debug("PEAPv~p Decoded message ~w", [PeapVer, DecodedMessage]),
+  {ok, InnerEap}=decodeTunneledMessage(SslData, LastEap, State),
 
-  NewState=
-    case maps:is_key(mschapv2, State) of
-      false -> State#{mschapv2 => eradius_eap:getNewMethodData()};
-      true -> State
-    end,
-
-  case eradius_mschap:handle({handle, DecodedMessage, LastRad}, NewState) of
-    %If we get an ignore, we probably should signal an error.
-    %{ignore, S} -> {reply, {warn, ignored}, starting, S};
-    %{ignore, bad_packet, S} -> {reply, {warn, bad_packet}, starting, S};
-    %{send_queued, S=#{tx_credits := Credits}} ->
-    %  case transmitIfPossible(S#{tx_credits := Credits+1}) of
-    %    {ok, NS} -> {reply, ok, running, NS};
-    %    {ok, no_work, NS} -> {reply, ok, running, NS}
-    %  end;
-    %{send_handled, NS} -> {reply, ok, NS};
-    {enqueue_and_send, {_, Type, Packets}, S} when
-        Type == request orelse Type == success ->
-      {ok, D}=prepareWork(Type, Id, Packets, S),
-      ok=eradius_peap_tls_srv:send(SrvPid, D),
-      {ok, S};
-    {auth_ok, {_, success, Packets, SuccessAttrs}, S} ->
-      {ok, D}=prepareWork(success, Id, Packets, S),
-      ok=eradius_peap_tls_srv:send(SrvPid, D),
-      lager:info("PEAPv~p Tx tunneled success", [PeapVer]),
-      {ok, S#{peap := MethodState#{state := inner_auth_success, success_attrs := SuccessAttrs}}};
-    {auth_fail, {_, failure, Packets}, S} ->
-      {ok, D}=prepareWork(failure, Id, Packets, S),
-      lager:info("PEAPv~p Tx tunneled failure", [PeapVer]),
-      ok=eradius_peap_tls_srv:send(SrvPid, D),
-      {ok, S#{peap := MethodState#{state := inner_auth_failure}}}
+  NewRadAttrs=RadAttrs#{eap_message := InnerEap},
+  NewRad=LastRad#eradius_rad{attrs=NewRadAttrs},
+  case eradius_eap:handle_rad_packet(NewRad, ?MODULE) of
+    {ok, #eradius_rad_handler_ret{code=RadType, attrs=EapProcAttrs}} ->
+      case RadType of
+        access_challenge ->
+          NewPS=PeapState,
+          NewSA=SuccessAttrs,
+          NewFA=FailureAttrs,
+          WorkType=request;
+        access_accept ->
+          NewPS=inner_auth_success,
+          NewSA=maps:remove(eap_message, EapProcAttrs),
+          NewFA=FailureAttrs,
+          WorkType=success;
+        access_reject ->
+          NewPS=inner_auth_failure,
+          NewSA=SuccessAttrs,
+          NewFA=maps:remove(eap_mssage, EapProcAttrs),
+          WorkType=failure
+      end,
+      #{eap_message := EapPayload}=EapProcAttrs,
+      {ok, TlsPacket}=prepareWork(WorkType, EapPayload, State),
+      ok=eradius_peap_tls_srv:send(SrvPid, TlsPacket),
+      NewState=State#{peap := MethodState#{state := NewPS, success_attrs := NewSA
+                                           ,failure_attrs := NewFA}},
+      {ok, NewState}
   end.
 
 %So, we COULD do TLS renegotiate if we were doing certificate-based
@@ -298,51 +291,55 @@ handle({ssl, SslSocket, SData}, State=#{current_method := peap
 %EAP conversation that proceedes exactly like the first, except
 %entirely within the TLS tunnel.
 %PEAPv0
-sendTlsIdentityRequest(_, #{tls_srv_pid := SrvPid
-                             ,peap := #{peap_ver := 0}}) ->
+sendTlsIdentityRequest(#{tls_srv_pid := SrvPid, peap := #{peap_ver := 0}}) ->
   Msg= <<1>>,
   ok=eradius_peap_tls_srv:send(SrvPid, Msg);
 %PEAPv1
-sendTlsIdentityRequest(Id, #{tls_srv_pid := SrvPid
-                             ,peap := #{peap_ver := 1}}) ->
-  %Ordinarily we would need to increment the EAP ID here.
-  %But! We are establishing a new EAP session, and to keep the IDs in
-  %THAT session in sync with the IDs in the PEAP session, we start
-  %from the ID of the outer session.
-  %
-  %Although, the IDs between the two EAP conversations could drift
-  %out of sync. So, FIXME: we really need to track the EAP IDs for the
-  %inner and outer conversations separately.
-  [Msg]=eradius_eap:encodeEapMessage(request, Id, <<1>>),
+sendTlsIdentityRequest(#{tls_srv_pid := SrvPid, peap := #{peap_ver := 1}}) ->
+  [Msg]=eradius_eap:encodeEapMessage(request, rand:uniform(100), <<1>>),
   ok=eradius_peap_tls_srv:send(SrvPid, Msg).
 
-decodeTunneledMessage(Message, #eradius_eap{code=Code, id=Id}, #{peap := #{peap_ver := 0}}) ->
+decodeTunneledMessage(<<Type, Data/binary>> =Message, #eradius_eap{code=Code, id=Id}, #{peap := #{peap_ver := 0}}) ->
   FakeLen=byte_size(Message)+4,
-  case Message of
-    <<26, Data/binary>> -> Type=mschapv2;
-    <<1, Data/binary>> -> Type=identity
-    %<<1, _:1/bytes, _:2/bytes, 33, _/binary>> (TODO: Possible EAP Extension packet)
+  case Code of
+    request  -> C=1;
+    response -> C=2;
+    success  -> C=3;
+    failure  -> C=4
   end,
-  {ok, #eradius_eap{code=Code, id=Id, length= <<FakeLen/integer>>, type=Type, typedata=Data}};
-decodeTunneledMessage(Message, #eradius_eap{id=Id}, #{peap := #{peap_ver := 1}}) ->
-  %FIXME: we really need to track the EAP IDs for the
-  %inner and outer conversations separately.
-  {ok, #eradius_eap{id=Id}}=eradius_eap:decodeMessage(Message).
+  Ret = <<C, Id, FakeLen:16, Type, Data/binary>>,
+  {ok, Ret};
+decodeTunneledMessage(Message, _, #{peap := #{peap_ver := 1}}) ->
+  {ok, Message}.
 
-%FIXME: It's janky to be hard-coding EAP Extension success and failure packets,
-%       but this works for now.
-prepareWork(success, Id, <<>>, #{peap := #{peap_ver := 0}}) ->
-  D= <<1, Id, 11:16, 33, 1:1, 0:1, 3:14, 2:16, 1:16>>,
+%FIXME: Support fragmented EAP payloads!
+prepareWork(Type, [<<_, Id, _/binary>>], #{peap := #{peap_ver := 0}}) when
+    Type == success orelse Type == failure ->
+  %Code (1) (request)
+  %ID (pulled from EAP packet)
+  %Length of whole packet (two bytes)
+  %Type (33)
+  %1:1, 0:1 (is-mandatory flag, followed by reserved bit)
+  %3:14 (Acknowledged result) (the only valid value for this field)
+  %2:16 (Length of following value field, in bytes)
+  %followed by either
+  %1:16 (PEAPv0 success)
+  %or
+  %2:16 (PEAPv0 failure)
+  case Type of
+    success -> Value=1;
+    failure -> Value=2
+  end,
+  D= <<1, Id, 11:16, 33, 1:1, 0:1, 3:14, 2:16, Value:16>>,
   11=byte_size(D),
   {ok, D};
-prepareWork(failure, Id, <<>>, #{peap := #{peap_ver := 0}}) ->
-  D= <<1, Id, 11:16, 33, 1:1, 0:1, 3:14, 2:16, 2:16>>,
-  11=byte_size(D),
-  {ok, D};
-prepareWork(request, _, Data, #{peap := #{peap_ver := 0}}) ->
+%FIXME: Support fragmented EAP payloads!
+prepareWork(request, [<<_:4/bytes, Data/binary>>], #{peap := #{peap_ver := 0}}) ->
+  %PEAPv0 doesn't wrap things in EAP unless they're
+  %success or failure packets.
   {ok, Data};
-prepareWork(Type, Id, Data, #{peap := #{peap_ver := 1}}) ->
-  {ok, [_]}=eradius_eap:prepareWork(Type, Id, Data).
+prepareWork(_, Payload, #{peap := #{peap_ver := 1}}) ->
+  {ok, Payload}.
 
 %Here are the rules:
 % Flags:

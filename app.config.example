@@ -13,5 +13,6 @@
                          ]}
              ,{nas_lookup_mods, [eradius_file_auth]}
              ,{user_lookup_mods, [eradius_file_auth]}
+             ,{preprocess_mods, [eradius_extract_called_station_ssid]}
             ]}
 ].

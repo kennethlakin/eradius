@@ -4,9 +4,6 @@
 
 -compile([{parse_transform, lager_transform}]).
 
-%FIXME: Should be in another module, but is (currently) useful as a bit of
-%       policy.
--export([wantsAdblock/1]).
 %eradius_auth stuff:
 -export([start_module/0, getName/0, lookup_nas/1, lookup_nas/2
          ,lookup_user/1, lookup_user/2, reload/0]).
@@ -113,19 +110,6 @@ passesRestrictions(Ref, Attrs) ->
 areAttrsASuperset(Reference, Attrs) ->
   lists:subtract(Reference, Attrs) == [].
 
-%%FIXME: This is here to support the "Are we coming from a no-adblock SSID?"
-%%       determination. It should not be here, but in another module.
-wantsAdblock(Attrs) ->
-  CSI=maps:get(called_station_id, Attrs, undefined),
-  case CSI of
-    undefined -> CalledStationId = <<>>;
-    CalledStationId -> CalledStationId
-  end,
-  case re:run(CalledStationId, <<".*-noadblock$">>) of
-    {match, _} -> false;
-    nomatch -> true
-  end.
-
 loadCredentials() ->
   %FIXME: Make this configurable and such.
   FileName="credentials",
@@ -187,29 +171,9 @@ convertNas({N, S}) ->
 %% for attributes Called-Station-Id Calling-Station-Id.
 %FIXME: Normalize Called-Station-Id MAC address as well.
 normalizeMacAddrs(RestrictAttrs=#{calling_station_id := CSI}) ->
-  NewCSI=normalizeMacAddr(CSI),
+  NewCSI=eradius_utils:normalizeMacAddr(CSI),
   RestrictAttrs#{calling_station_id := NewCSI};
 normalizeMacAddrs(RestrictAttrs) -> RestrictAttrs.
-
-%Change separators to "-" (or insert them) and change characters to uppercase.
-normalizeMacAddr(<<A:16, B:16, C:16, D:16, E:16, F:16>>) ->
-  S= <<"-">>,
-  MA= <<A:16,S/binary,B:16,S/binary,C:16,S/binary
-        ,D:16,S/binary,E:16,S/binary,F:16>>,
-  uppercaseMacAddr(MA);
-normalizeMacAddr(MA= <<_:16, "-", _:16, "-", _:16, "-"
-                   ,_:16, "-", _:16, "-", _:16>>) ->
-  uppercaseMacAddr(MA);
-normalizeMacAddr(<<A:16, _:8, B:16, _:8, C:16, _:8
-                   ,D:16, _:8, E:16, _:8, F:16>>) ->
-  S= <<"-">>,
-  MA= <<A:16,S/binary,B:16,S/binary,C:16,S/binary
-        ,D:16,S/binary,E:16,S/binary,F:16>>,
-  uppercaseMacAddr(MA).
-
-uppercaseMacAddr(MacAddr) ->
-  A=string:to_upper(erlang:binary_to_list(MacAddr)),
-  erlang:list_to_binary(A).
 
 handle_info(_,State) -> {noreply, State}.
 handle_cast(_, State) -> {noreply, State}.

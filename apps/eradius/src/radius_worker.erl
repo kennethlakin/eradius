@@ -14,35 +14,48 @@ start(Mod, Args) ->
 start_link({Mod, Args}) ->
   Mod:start_worker(Args).
 
-start_worker(Args={_,_,_}) ->
+start_worker(Args={_,_,_,_}) ->
   gen_server:start_link(?MODULE, Args, []).
 
-init(S={_,_,_}) ->
+init(S={Addr, Port, Data, _Sock}) ->
+  radius_server:insertWorkEntry(?MODULE, {Addr, Port, Data}, working, self()),
+  eradius_stats:worker_start(self()),
   lager:debug("RADIUS Worker started with args ~p", [S]),
   self() ! start_work,
   {ok, S}.
 
-handle_info(start_work, State={Addr, Port, Data}) ->
-  radius_server:insertWorkEntry(?MODULE, {Addr, Port, Data}, working, self()),
+handle_info(start_work, State={Addr, Port, Data, Sock}) ->
   case eradius_auth:lookup_nas(Addr) of
     {error, not_found} ->
       %FIXME: Add statistics?
-      lager:notice("RADIUS Dropping packet because from unrecognized NAS"),
+      lager:notice("RADIUS Dropping packet from unrecognized NAS"),
       lager:debug("RADIUS NAS ~p", [Addr]);
     {ok, NASSecret} ->
       case eradius_tx:findCachedEntry(Addr, Port, Data) of
         {ok, {_, Pkt}} ->
           lager:info("RADIUS Packet is retransmission. Using cache"),
-          eradius_tx:resend(Addr, Port, Pkt);
+          eradius_tx:resend(Addr, Port, Pkt, Sock);
         none ->
           case eradius_decode:decodeRadius(Data) of
-            {ok, Rad=#eradius_rad_raw{attrs=Rest, auth=Auth}} ->
+            {ok, Rad=#eradius_rad_raw{attrs=Rest, auth=Auth, id=RadId}} ->
               case eradius_decode:decodeAttributes(Rest, Addr, Auth) of
-                {ok, Attrs} ->
-                  lager:debug("RADIUS Attrs decoded ~p", [Attrs]),
-                  handlePacket(NASSecret, Addr, Port, Rad, Attrs, Data);
+                {ok, RadAttrs} ->
+                  lager:debug("RADIUS Attrs decoded ~p", [RadAttrs]),
+                  {ok, Attrs}=eradius_preprocess:preprocess(Addr, RadAttrs),
+                  lager:debug("RADIUS Attrs preprocessed ~p", [Attrs]),
+                  case handlePacket(NASSecret, Addr, Port, Rad, Attrs, Data, Sock) of
+                    {ok, #eradius_rad_handler_ret{code=RadType, attrs=TheAttrs}} ->
+                      TxPkt=eradius_decode:encodeRadius(Addr, RadType, RadId, Auth, TheAttrs),
+                      eradius_tx:send(Addr, Port, TxPkt, Data, Sock);
+                    {drop, Reason} ->
+                      lager:debug("RADIUS Packet dropped. Reason ~w", [Reason]); %FIXME: Add statistics?
+                    Ret ->
+                      lager:notice("RADIUS Handler failed. Reason ~p. Sending Access-Reject", [Ret]),
+                      sendAccessReject(Addr, Port, RadId, Auth, Data, Sock)
+                  end;
                 {error, R} ->
-                  lager:notice("RADIUS Attr decode error ~p", [R])
+                  lager:notice("RADIUS Attr decode error ~p Sending Access-Reject", [R]),
+                  sendAccessReject(Addr, Port, RadId, Auth, Data, Sock, <<"Attribute decode error">>)
               end;
             {discard, _} ->
               %FIXME: Increment a discard counter. Discriminate between the various
@@ -51,11 +64,32 @@ handle_info(start_work, State={Addr, Port, Data}) ->
           end
       end
   end,
+  eradius_stats:worker_stop(self()),
   {stop, normal, State}.
 
-handlePacket(NASSecret, Addr, Port, #eradius_rad_raw{id=Id, auth=Auth}, Attrs, RadPacket) ->
-  %%FIXME: Notice that we never even inspect the radius code 
-  %%       (in #eradius_rad_raw.code) to determine what to
+%See RFC5997.
+handlePacket(NASSecret, _, _, #eradius_rad_raw{type=status_server, auth=Auth}, Attrs, RadPacket, _) ->
+  %FIXME: Consider rate-limiting these.
+  case eradius_decode:verifyPacket(NASSecret, Auth, Attrs, RadPacket) of
+    error ->
+      lager:notice("RADIUS Packet verification failed"),
+      {drop, verify_failed};
+    ok ->
+      {ok, #eradius_rad_handler_ret{code=access_accept}}
+  end;
+%See RFC2866
+handlePacket(NASSecret, Addr, _, #eradius_rad_raw{type=accounting_request, auth=Auth}, Attrs, RadPacket, _) ->
+  case eradius_decode:verifyPacket(NASSecret, Auth, Attrs, RadPacket) of
+    error ->
+      lager:notice("RADIUS Packet verification failed"),
+      {drop, verify_failed};
+    ok ->
+      eradius_stats:accounting_request(Addr, Attrs),
+      {ok, #eradius_rad_handler_ret{code=accounting_response}}
+  end;
+handlePacket(NASSecret, Addr, Port, #eradius_rad_raw{id=Id, auth=Auth}, Attrs, RadPacket, Sock) ->
+  %%FIXME: Notice that we never even inspect the radius type
+  %%       (in #eradius_rad_raw.type) to determine what to
   %%       do... we just assume that it is an access_challenge
   %%       and proceed.
   NextStep=radius_server:determineWhatToDo(Attrs),
@@ -71,7 +105,8 @@ handlePacket(NASSecret, Addr, Port, #eradius_rad_raw{id=Id, auth=Auth}, Attrs, R
     ok ->
       case eradius_decode:verifyPacket(NASSecret, Auth, Attrs, RadPacket) of
         error ->
-          lager:notice("RADIUS Packet verification failed");
+          lager:notice("RADIUS Packet verification failed"),
+          {drop, verify_failed};
         ok ->
           case Attrs of
             #{state := StateAttr} ->
@@ -80,18 +115,30 @@ handlePacket(NASSecret, Addr, Port, #eradius_rad_raw{id=Id, auth=Auth}, Attrs, R
               lager:debug("RADIUS New conversation"),
               StateAttr=radius_server:getNewStateData()
           end,
-          case NextStep:handlePacket(#eradius_rad{ip=Addr, port=Port, auth=Auth, id=Id, originalPacket=RadPacket
-                                                  ,state=StateAttr, attrs=Attrs}) of
-            ok -> ok;
-            {drop, _} -> ok; %FIXME: Add statistics?
-            ErrorRet -> lager:notice("RADIUS Handler failed. Reason ~p", [ErrorRet])
+          try
+            NextStep:handle_rad_packet(#eradius_rad{ip=Addr, port=Port, auth=Auth, id=Id, originalPacket=RadPacket
+                                                    ,state=StateAttr, attrs=Attrs})
+          catch
+            Class:Reason ->
+              Stacktrace=erlang:get_stacktrace(),
+              lager:warning("RADIUS RADIUS handler threw exception. Sending Access-Reject."),
+              sendAccessReject(Addr, Port, Id, Auth, RadPacket, Sock),
+              erlang:raise(Class, Reason, Stacktrace)
           end
       end
   end.
 
-terminate(_, {Addr, Port, Data}) ->
+%Convenience function to send an Access-Reject when we encounter an unexpected
+%error.
+sendAccessReject(Addr, Port, Id, Auth, RadPacket, Sock) ->
+  sendAccessReject(Addr, Port, Id, Auth, RadPacket, Sock, <<"Internal server error">>).
+sendAccessReject(Addr, Port, Id, Auth, RadPacket, Sock, Message) when is_binary(Message) ->
+  TxPkt=eradius_decode:encodeRadius(Addr, access_reject, Id, Auth, #{reply_message => Message}),
+  eradius_tx:send(Addr, Port, TxPkt, RadPacket, Sock).
+
+terminate(_, {Addr, Port, Data, _}) ->
   ok=radius_server:deleteWorkEntry(?MODULE, {Addr, Port, Data}).
 
-handle_call(_, _, State) -> {reply, ok, State, 0}.
-handle_cast(_, State) -> {noreply, State, 0}.
+handle_call(_, _, State) -> {reply, {error, unexpected}, State}.
+handle_cast(_, State) -> {noreply, State}.
 code_change(_, State, _) -> {ok, State}.

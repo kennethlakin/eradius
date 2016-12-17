@@ -1,4 +1,4 @@
--module(eradius_auth_sup).
+-module(eradius_preprocess_sup).
 
 -behavior(supervisor).
 
@@ -23,5 +23,5 @@ start_link() ->
 init(Args) ->
   {ok, {{one_for_one, 5, 10}, [
                                #{id => eradius_auth:getName()
-                                 ,start => {eradius_auth, start_link, Args}}
+                                 ,start => {eradius_preprocess, start_link, Args}}
                               ]}}.
